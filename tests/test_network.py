@@ -206,3 +206,12 @@ def test_connect_failure_is_httpcore_error(fake_network, monkeypatch):
     with pytest.raises(httpcore.ConnectError):
         network.PublicNetworkBackend().connect_tcp('public.test', 80)
     assert fake_network.closed == [None]
+
+
+@pytest.mark.parametrize('url', ['http://g\u0456thub.com/', 'http://xn--gthub-n2e.com/'])
+def test_idn_normalization_does_not_remove_homoglyph_policy(fake_network, url):
+    fake_network.replies = [reply()]
+    with network.public_http_client() as client, pytest.raises(network.UnsafeDestination):
+        client.get(url)
+    assert fake_network.dns == []
+    assert fake_network.connections == []

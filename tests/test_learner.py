@@ -200,3 +200,14 @@ def test_no_learn_when_det_guard_fired():
             watcher.evaluate(session_id="s1", tool_name="bash", args={"command": "rm -rf /"})
 
     assert called == [], "_maybe_learn should not fire when det guard already blocked"
+
+
+@pytest.mark.parametrize('command,tool', [
+    ('open(filename).read()', 'python'),
+    ('cat "$PATH_TO_READ"', 'terminal'),
+    ('custom_program /tmp/unresolved-role', 'terminal'),
+])
+def test_synthesis_skips_incomplete_path_sources_without_calling_model(command, tool):
+    model = MagicMock()
+    assert synthesize_pattern(command, 'uncertain path', model, tool_name=tool) is None
+    model.assert_not_called()

@@ -69,6 +69,8 @@ def glob_to_regex(glob: str) -> re.Pattern[str]:
 def load_protected_paths(rules_path: str | Path | None = None) -> dict[str, Any]:
     global _cached  # noqa: PLW0603 -- process-local rule cache
     if rules_path is None:
+        if _cached is not None:
+            return _cached
         rules = [{**r, "regex": glob_to_regex(expand_home(r["pattern"])),
                   "expanded": expand_home(r["pattern"])}
                  for r in _DEFAULT_RULES]
@@ -84,7 +86,10 @@ def load_protected_paths(rules_path: str | Path | None = None) -> dict[str, Any]
          "expanded": expand_home(r["pattern"])}
         for r in (raw.get("protectedPaths") or [])
     ]
-    cfg = raw.get("pathGuard") or {"enabled": True, "failurePolicy": "fail-closed", "bashLikeTools": []}
+    configured = raw.get("pathGuard") or {}
+    cfg = {"enabled": configured.get("enabled") is not False,
+           "failurePolicy": configured.get("failurePolicy") or _DEFAULT_FAILURE_POLICY,
+           "bashLikeTools": configured.get("bashLikeTools") or []}
     _cached = {"rules": rules, "config": cfg, "_source": str(rules_path)}
     return _cached
 

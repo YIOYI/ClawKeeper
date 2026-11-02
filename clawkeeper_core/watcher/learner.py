@@ -385,17 +385,17 @@ def synthesize_pattern(  # noqa: PLR0911 -- admission rejects invalid or incompl
     try:
         views = {target: target_texts(target, source_event)
                  for target in ("exec_gate", "script_body_scan")}
+        paths = target_texts("path_guard", source_event)
+        facts = {subject: target_texts("script_body_scan" if subject == "python.operation" else "exec_gate", source_event, subject)
+                 for subject in ("program.name", "python.module", "script.path", "python.operation")}
     except ValueError:
         return None  # incomplete source is not a learnable negative sample
     prompt = _SYNTHESIS_PROMPT.format(
         tool_name=tool_name,
         command=json.dumps(safe_params)[:1500],
-        paths=json.dumps(target_texts("path_guard", {
-            "toolName": tool_name, "params": safe_params,
-        })),
+        paths=json.dumps(paths),
         views=json.dumps(views),
-        facts=json.dumps({subject: target_texts("script_body_scan" if subject == "python.operation" else "exec_gate", source_event, subject)
-                          for subject in ("program.name", "python.module", "script.path", "python.operation")}),
+        facts=json.dumps(facts),
         reason=redact(reason)[0][:300],
         benign=", ".join(f'"{b}"' for b in _BENIGN_CORPUS),
     )

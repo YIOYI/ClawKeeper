@@ -203,8 +203,14 @@ def url_safety_guard(event: dict, *, allow_private: bool = False) -> dict | None
         except (UnicodeError, UnicodeEncodeError):
             host_ascii = host
 
-        # 2. Homoglyph detection (BEFORE IDN — match on the raw host)
-        is_homoglyph, suspicious, doppelganger = _detect_homoglyph(host)
+        # HTTP clients normalize Unicode hosts to IDNA before the transport
+        # sees them. Inspect decoded A-labels too, preserving the same policy
+        # for a Unicode spelling and its punycode equivalent.
+        try:
+            host_unicode = host_ascii.encode("ascii").decode("idna")
+        except UnicodeError:
+            host_unicode = host
+        is_homoglyph, suspicious, doppelganger = _detect_homoglyph(host_unicode)
         if is_homoglyph:
             return {
                 "block": True,
