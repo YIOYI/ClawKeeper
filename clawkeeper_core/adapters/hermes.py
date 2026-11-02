@@ -99,9 +99,9 @@ def _default_pre_guards() -> list[GuardCallable]:
     """
     return [
         guard_execution,            # dangerous-command regex (CK's broader set than Hermes's)
-        guard_before_tool_call,     # protected paths — also scans embedded paths in script bodies
+        guard_before_tool_call,     # protected file accesses from shared command/path facts
         url_safety_guard,           # homoglyph + SSRF + blocked-hostname
-        script_body_scan_guard,     # dynamic-path-construction heuristic (Path.home + .aws/, etc.)
+        script_body_scan_guard,     # sensitive accesses through bounded path associations
     ]
 
 

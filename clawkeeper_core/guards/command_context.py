@@ -27,6 +27,7 @@ from clawkeeper_core.command_facts import (
     Diagnostic,
     Invocation,
     Origin,
+    PathAccess,
     Pipeline,
     Redirection,
     Source,
@@ -63,6 +64,7 @@ class CommandAnalysis:
     pipelines: list[Pipeline] = field(default_factory=list)
     diagnostics: list[Diagnostic] = field(default_factory=list)
     data: list[DataSpan] = field(default_factory=list)
+    paths: list[PathAccess] = field(default_factory=list)
     node_calls: dict[Origin, Invocation] = field(default_factory=dict)
     origin: Origin | None = None
     field: tuple[str, ...] = ()
@@ -93,7 +95,7 @@ class CommandAnalysis:
             self.origin = previous
 
     def freeze(self) -> Analysis:
-        return Analysis(tuple(self.sources), tuple(self.invocations), tuple(self.pipelines), tuple(self.diagnostics), tuple(self.data))
+        return Analysis(tuple(self.sources), tuple(self.invocations), tuple(self.pipelines), tuple(self.diagnostics), tuple(self.data), tuple(self.paths))
 
     def add(self, argv, literals, words=None, redirects=(), *, kind="process") -> Invocation:
         origin = self.origin
@@ -103,6 +105,9 @@ class CommandAnalysis:
         call = Invocation(Word(words[0].raw, name, "operation" if kind == "python.operation" else "program", words[0].origin), tuple(arguments),
                           origin, self.sources[origin.source].language, tuple(redirects), _effective_stdin(redirects), kind)
         self.invocations.append(call)
+        from clawkeeper_core.path_analysis import shell_paths  # noqa: PLC0415
+
+        self.paths.extend(shell_paths(call))
         return call
 
 
@@ -395,6 +400,10 @@ def _python_body(code: str, result: CommandAnalysis, depth: int) -> None:  # noq
             return f"{dotted(node.value)}.{node.attr}"
         return ""
 
+    from clawkeeper_core.path_analysis import python_paths  # noqa: PLC0415
+
+    result.paths.extend(python_paths(tree, aliases, location))
+
     for node in nodes:
         if not isinstance(node, ast.Call):
             continue
@@ -585,7 +594,7 @@ def _shell(source: str, result: CommandAnalysis, depth: int, *, kind: str | None
         _shell_body(source, result, depth)
 
 
-def _shell_body(source: str, result: CommandAnalysis, depth: int) -> None:  # noqa: PLR0912 -- syntax node dispatch
+def _shell_body(source: str, result: CommandAnalysis, depth: int) -> None:  # noqa: PLR0912, PLR0915 -- bounded syntax node dispatch
     if depth > MAX_DEPTH:
         raise AnalysisIncomplete("nested execution depth exceeded")
     data = source.encode("utf-8")
@@ -631,6 +640,10 @@ def _shell_body(source: str, result: CommandAnalysis, depth: int) -> None:  # no
                 _heredoc(node, result, depth)
             elif node.type == "comment":
                 result.data.append(DataSpan(result.origin, "comment"))
+            elif node.type == "file_redirect":
+                redirect = _redirection(node, result)
+                if redirect.kind == "file" and redirect.operator not in {">&", "<&"}:
+                    result.paths.append(PathAccess(redirect.target.value, redirect.operator, redirect.origin))
             elif (
                 node.type == "function_definition"
                 and _text(node.child_by_field_name("name")) == ":"

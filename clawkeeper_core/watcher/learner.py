@@ -155,6 +155,9 @@ def minimize_candidate(candidate: PatternCandidate) -> PatternCandidate:  # noqa
     legacy_ids = candidate.legacy_ids or []
     if not isinstance(legacy_ids, list) or any(i != rule_id(candidate.guard_target, candidate.pattern) for i in legacy_ids):
         raise ValueError("invalid legacy rule identities")
+    if (candidate.guard_target == "path_guard" and candidate.source_view_version < VALIDATION_VERSION
+            and (candidate.source_facts is not None or candidate.source_texts is not None)):
+        raise ValueError("legacy path sample has no access provenance; relearn from a tool event")
     if candidate.source_facts is not None:
         if not isinstance(candidate.source_facts, list) or len(candidate.source_facts) > MAX_TEXTS:
             raise ValueError("invalid source facts")
@@ -169,7 +172,7 @@ def minimize_candidate(candidate: PatternCandidate) -> PatternCandidate:  # noqa
             "toolName": candidate.source_tool_name,
             "params": minimal_params(candidate.source_args, candidate.source_command),
         }, subject)
-    elif candidate.source_view_version in (3, 4, VALIDATION_VERSION) or candidate.guard_target == "path_guard":
+    elif candidate.source_view_version in (3, 4, 5, VALIDATION_VERSION):
         texts = candidate.source_texts
         if candidate.source_view_version == _NAME_ONLY_VIEW_VERSION and candidate.subject is None and candidate.guard_target != "path_guard":
             if isinstance(texts, list) and texts and all(isinstance(t, str) and re.fullmatch(r"[\w.+:-]+", t) and not t.startswith("python:") for t in texts):

@@ -27,7 +27,7 @@ def test_blocks_path_home_aws_credentials():
     d = script_body_scan_guard(_ev(cmd))
     assert d is not None and d["block"], f"expected block, got {d}"
     assert d["source"].startswith("script_body_scan")
-    assert "Path.home" in d["evidence"]["file_op_markers"] or "RawConfigParser" in d["evidence"]["file_op_markers"]
+    assert ".read" in d["evidence"]["file_op_markers"]
 
 
 def test_blocks_os_path_expanduser_ssh():
@@ -76,8 +76,8 @@ def test_doc_string_mention_alone_does_not_fire():
     assert d is None
 
 
-def test_distance_too_far_does_not_fire():
-    # File-op marker FAR from the .aws mention — shouldn't fire on coincidence.
+def test_unrelated_shell_data_does_not_fire():
+    # A path printed as data is unrelated to a later harmless operation.
     cmd = (
         "echo 'note: ~/.aws/credentials is mentioned here'\n"
         + ("\n" * 200)
@@ -85,6 +85,5 @@ def test_distance_too_far_does_not_fire():
         + "\nopen('/etc/hostname').read()"
     )
     d = script_body_scan_guard(_ev(cmd))
-    # The /etc/hostname read is innocuous AND the .aws marker is >500 chars
-    # away from the open(); guard should abstain.
+    # The .aws mention is output data, so the guard should abstain.
     assert d is None or d["block"] is False or "etc/" not in str(d.get("reason"))
