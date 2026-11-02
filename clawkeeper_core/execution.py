@@ -32,13 +32,13 @@ def analysis_scope():
         _analyses.reset(token)
 
 
-def analyze_event(event: dict) -> Analysis:
+def analyze_event(event: dict, *, bash_like_tools: list[str] | None = None) -> Analysis:
     from clawkeeper_core.guards.command_context import analyze_requests  # noqa: PLC0415
     from clawkeeper_core.guards.exec_gate import _execution_requests, load_exec_gate  # noqa: PLC0415
 
     try:
         requests = _execution_requests(event.get("toolName"), event.get("params"),
-                                       load_exec_gate()["config"]["bashLikeTools"])
+                                       [*load_exec_gate()["config"]["bashLikeTools"], *(bash_like_tools or [])])
         key = tuple(requests)
         cache = _analyses.get()
         if cache is not None and key in cache:

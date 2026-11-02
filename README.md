@@ -229,18 +229,52 @@ New learned rules select a semantic `subject`: `program.name`, `python.module`,
 `script.path`, `python.operation` or `path`. Names use full matching; paths use
 search. The `invocation` subject preserves the earlier executable-first matching
 projection for rules that need several arguments. Synthesis, validation, reload
-and enforcement use the same field selectors. The script heuristic also uses
-parsed calls, excluding comments, standalone Python strings and recognized
-literal output data while retaining dynamic-path proximity detection.
+and enforcement use the same field selectors. Path checks consume parsed access
+operands and explicit file-tool path fields,
+excluding output data and document contents. Python tracks bounded literal
+assignments, path joins and visible loop values; script checks use those same
+access facts instead of a character-distance window. Unknown file operands or
+unsupported execution contexts request review. Relative operands use the event's
+`cwd` (or `params.cwd`/`workdir`/`working_directory`); relative access following a
+directory change requires review. This is not arbitrary Python data-flow
+analysis or a filesystem sandbox.
 
 Source samples carry a subject and schema version. Legacy raw samples are
 reparsed; version-3 bare program samples migrate to `program.name` so an anchored
 `node$` rule still matches `node script.js`. Incompatible samples stay inactive
 with an inspectable reason. Version-4 invocation samples retain their projection.
-Protocol **2**, validator **5**, and subject schema **1** prevent silently mixing
+Pre-validator-6 normalized path samples lack access provenance and become
+inactive with a relearning reason; their historical IDs remain deletable. Legacy
+records that retain tool arguments are reanalyzed before activation.
+Protocol **2**, validator **6**, and subject schema **1** prevent silently mixing
 matching semantics; upgrade Watcher and adapters together. Immutable snapshots,
 atomic replacement, deletions (including legacy IDs) and restart synchronization
 from issues #7/#8 remain covered by tests.
+
+For HTTP tools, use the connection-enforcing client inside the tool handler:
+
+```python
+from clawkeeper_core.network import public_http_client
+
+with public_http_client() as client:
+    response = client.get("https://example.com/docs")
+    response.raise_for_status()
+    text = response.text
+```
+
+Every new connection resolves and checks all IPv4/IPv6 answers, connects directly
+to a validated numeric address and verifies the peer. Redirect requests use the
+same policy, including same-host reconnects; DNS failures and mixed public/private
+answers fail closed. The original hostname remains the HTTP Host and TLS SNI,
+with certificate verification enabled. Environment proxies are disabled.
+`UnsafeDestination` is a transport error and should be surfaced as a refused
+fetch. Async hosts can call this synchronous client in a worker thread.
+
+`url_safety_guard` remains an offline text check: it does not resolve DNS or
+control a host's curl, browser or independent HTTP client. Such tools need this
+transport at their actual fetch boundary or host-level egress isolation. Installing
+a pre-tool guard alone does not provide network isolation. See
+[the supported boundaries and verification](docs/security-boundaries.md).
 
 Inspect a proposed call without running it or invoking a Judge:
 

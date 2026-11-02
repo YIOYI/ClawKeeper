@@ -23,14 +23,15 @@ URLs via different attributes (`event["url"]` vs `event["params"]["url"]`),
 pass extractor kwargs to `make_url_safety_guard(...)`.
 """
 
+# Homoglyph fixtures intentionally contain confusable characters.
+# ruff: noqa: RUF001, RUF002
+
 from __future__ import annotations
 
 import ipaddress
 import re
-import unicodedata
-from typing import Any, Callable
+from collections.abc import Callable
 from urllib.parse import urlparse
-
 
 # ── Blocked IP ranges (RFC 1918 + extras Hermes documents) ──────────────────
 
@@ -123,7 +124,7 @@ def _looks_like_ip(host: str) -> tuple[bool, str | None]:
     return False, None
 
 
-def _ip_is_blocked(host: str) -> tuple[bool, str | None]:
+def _ip_is_blocked(host: str) -> tuple[bool, str | None]:  # noqa: PLR0911 -- address-family policy branches
     """Return (blocked, reason)."""
     is_ip, family = _looks_like_ip(host)
     if not is_ip:
@@ -136,6 +137,10 @@ def _ip_is_blocked(host: str) -> tuple[bool, str | None]:
                     return True, f"IPv4 in blocked range {net}"
         elif family == "v6":
             addr = ipaddress.IPv6Address(host.strip("[]"))
+            if addr.ipv4_mapped is not None:
+                return _ip_is_blocked(str(addr.ipv4_mapped))
+            if not addr.is_global or addr.is_multicast:
+                return True, "IPv6 is not public unicast"
             for net in _BLOCKED_V6_NETS:
                 if addr in net:
                     return True, f"IPv6 in blocked range {net}"
@@ -198,8 +203,14 @@ def url_safety_guard(event: dict, *, allow_private: bool = False) -> dict | None
         except (UnicodeError, UnicodeEncodeError):
             host_ascii = host
 
-        # 2. Homoglyph detection (BEFORE IDN — match on the raw host)
-        is_homoglyph, suspicious, doppelganger = _detect_homoglyph(host)
+        # HTTP clients normalize Unicode hosts to IDNA before the transport
+        # sees them. Inspect decoded A-labels too, preserving the same policy
+        # for a Unicode spelling and its punycode equivalent.
+        try:
+            host_unicode = host_ascii.encode("ascii").decode("idna")
+        except UnicodeError:
+            host_unicode = host
+        is_homoglyph, suspicious, doppelganger = _detect_homoglyph(host_unicode)
         if is_homoglyph:
             return {
                 "block": True,
@@ -220,7 +231,7 @@ def url_safety_guard(event: dict, *, allow_private: bool = False) -> dict | None
             }
 
         # 3. Blocked hostname list
-        if host_ascii in _BLOCKED_HOSTNAMES:
+        if host_ascii.rstrip(".") in _BLOCKED_HOSTNAMES:
             return {
                 "block": True,
                 "outcome": "deny",

@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from clawkeeper_core.command_facts import PathAccess
+from clawkeeper_core.execution import analysis_scope, analyze_event
 from clawkeeper_core.learned_rules import match_learned
 
 _DEFAULT_FAILURE_POLICY = "fail-closed"
-_BASH_LIKE_HINT_RE = re.compile(r"bash|shell|exec|command|terminal", re.IGNORECASE)
 
 _DEFAULT_RULES = [
     {"pattern": "~/.ssh/**", "severity": "CRITICAL", "reason": "SSH key material"},
@@ -27,10 +29,6 @@ _DEFAULT_RULES = [
     {"pattern": "/etc/shadow", "severity": "CRITICAL", "reason": "System password hashes"},
     {"pattern": "/etc/sudoers", "severity": "CRITICAL", "reason": "Sudoer rules"},
 ]
-
-_PATH_TOKEN_RE = re.compile(
-    r"""(?:^|[\s'"`=:;(){}\[\],])(~/[^\s'"`;|&()<>]+|/[A-Za-z0-9._/\-]+|\.{1,2}/[^\s'"`;|&()<>]+)"""
-)
 
 _cached: dict[str, Any] | None = None
 
@@ -69,8 +67,10 @@ def glob_to_regex(glob: str) -> re.Pattern[str]:
 
 
 def load_protected_paths(rules_path: str | Path | None = None) -> dict[str, Any]:
-    global _cached
+    global _cached  # noqa: PLW0603 -- process-local rule cache
     if rules_path is None:
+        if _cached is not None:
+            return _cached
         rules = [{**r, "regex": glob_to_regex(expand_home(r["pattern"])),
                   "expanded": expand_home(r["pattern"])}
                  for r in _DEFAULT_RULES]
@@ -86,23 +86,27 @@ def load_protected_paths(rules_path: str | Path | None = None) -> dict[str, Any]
          "expanded": expand_home(r["pattern"])}
         for r in (raw.get("protectedPaths") or [])
     ]
-    cfg = raw.get("pathGuard") or {"enabled": True, "failurePolicy": "fail-closed", "bashLikeTools": []}
+    configured = raw.get("pathGuard") or {}
+    cfg = {"enabled": configured.get("enabled") is not False,
+           "failurePolicy": configured.get("failurePolicy") or _DEFAULT_FAILURE_POLICY,
+           "bashLikeTools": configured.get("bashLikeTools") or []}
     _cached = {"rules": rules, "config": cfg, "_source": str(rules_path)}
     return _cached
 
 
 def reset_path_guard_cache() -> None:
-    global _cached
+    global _cached  # noqa: PLW0603 -- process-local rule cache
     _cached = None
 
 
 def normalize_path(input_path: Any, cwd: str | Path | None = None) -> str | None:
     if not isinstance(input_path, str) or not input_path:
         return None
-    p = expand_home(input_path.strip()) or ""
+    p = input_path.strip()
     # Strip surrounding quotes
     if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
         p = p[1:-1]
+    p = expand_home(p) or ""
     if not os.path.isabs(p):
         p = os.path.abspath(os.path.join(str(cwd or os.getcwd()), p))
     try:
@@ -124,64 +128,77 @@ def match_protected(abs_path: str | None, rules: list[dict[str, Any]]) -> dict[s
     return None
 
 
+class PathAnalysisIncomplete(ValueError):
+    """A visible file access could not be resolved by bounded analysis."""
+
+
+_PATH_FIELDS = {"path", "file", "file_path", "filePath", "filename", "file_name",
+                "directory", "dir_path", "source", "destination", "target", "paths", "location"}
+_MAX_ENVELOPE_DEPTH = 64
+_DATA_FIELDS = {"content", "body", "description", "metadata", "env", "environment", "headers"}
+
+
+def path_facts(event: dict, *, bash_like_tools=None):
+    facts = analyze_event(event, bash_like_tools=bash_like_tools)
+    paths = list(facts.paths)
+    changing_cwd = {c.origin.source for c in facts.calls
+                    if c.executable in {"cd", "pushd", "popd", "python:os.chdir"}
+                    or (c.executable in {"env", "sudo"} and any(
+                        a.display.split("=", 1)[0] in {"-C", "--chdir", "-D", "-R"} for a in c.arguments))}
+    if changing_cwd:
+        for source_id, source in enumerate(facts.sources):
+            if source.parent is not None and source.parent.source in changing_cwd:
+                changing_cwd.add(source_id)
+        paths = [replace(p, value=None) if p.origin is not None and p.origin.source in changing_cwd
+                 and p.value is not None and not p.value.startswith(("/", "~/")) else p
+                 for p in paths]
+    remaining = 10_000
+
+    def collect(obj, field=()):
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or len(field) > _MAX_ENVELOPE_DEPTH:
+            raise PathAnalysisIncomplete("path envelope budget exhausted")
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in _DATA_FIELDS:
+                    continue
+                if key in _PATH_FIELDS:
+                    values = value if isinstance(value, list) else [value]
+                    for item in values:
+                        if isinstance(item, str) and item:
+                            paths.append(PathAccess(item, "file-tool", None, field=("params", *field, key)))
+                elif isinstance(value, (dict, list)):
+                    collect(value, (*field, key))
+        elif isinstance(obj, list):
+            for i, value in enumerate(obj):
+                collect(value, (*field, str(i)))
+
+    collect(event.get("params") or {})
+    return facts, paths
+
+
+def event_cwd(event):
+    params = event.get("params") or {}
+    return event.get("cwd") or params.get("cwd") or params.get("workdir") or params.get("working_directory")
+
+
+@analysis_scope()
 def extract_paths_from_command(command: str | None) -> list[str]:
-    if not isinstance(command, str) or not command:
-        return []
-    out: set[str] = set()
-    for m in _PATH_TOKEN_RE.finditer(command):
-        token = m.group(1)
-        if len(token) >= 2:
-            out.add(token)
-    return list(out)
+    return extract_paths_from_params("terminal", {"command": command})
 
 
-def _collect_string_values(obj: Any, out: list[str] | None = None) -> list[str]:
-    if out is None:
-        out = []
-    if obj is None:
-        return out
-    if isinstance(obj, str):
-        out.append(obj)
-    elif isinstance(obj, list):
-        for v in obj:
-            _collect_string_values(v, out)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            _collect_string_values(v, out)
-    return out
-
-
-_BASENAME_RE = re.compile(r"^(id_rsa|id_ed25519|\.env|credentials|shadow|sudoers)$", re.IGNORECASE)
-
-
+@analysis_scope()
 def extract_paths_from_params(tool_name: Any, params: Any, *, bash_like_tools: list[str] | None = None) -> list[str]:
-    bash_like = {s.lower() for s in (bash_like_tools or [])}
-    t = str(tool_name or "").lower()
-    looks_like_bash = t in bash_like or bool(_BASH_LIKE_HINT_RE.search(t))
-    candidates: set[str] = set()
-    p = params if isinstance(params, dict) else {}
-
-    if looks_like_bash:
-        cmd_parts = [v for v in (p.get(k) for k in ("command", "cmd", "script", "input", "code", "bash", "shell"))
-                     if isinstance(v, str)]
-        text = "\n".join(cmd_parts) if cmd_parts else "\n".join(_collect_string_values(params))
-        for t2 in extract_paths_from_command(text):
-            candidates.add(t2)
-
-    for v in _collect_string_values(params):
-        s = v.strip()
-        if not s:
-            continue
-        if s.startswith("~/") or s.startswith("~\\") or os.path.isabs(s):
-            candidates.add(s)
-        elif s.startswith("./") or s.startswith("../"):
-            candidates.add(s)
-        elif _BASENAME_RE.match(s):
-            candidates.add(s)
-    return list(candidates)
+    event = {"toolName": tool_name, "params": params}
+    facts, paths = path_facts(event, bash_like_tools=bash_like_tools)
+    if not facts.complete or any(p.value is None or p.certainty != "access" for p in paths):
+        raise PathAnalysisIncomplete("path context analysis incomplete")
+    return sorted({p.value for p in paths})
 
 
-def guard_before_tool_call(event: dict[str, Any]) -> dict[str, Any]:
+@analysis_scope()
+def guard_before_tool_call(event: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911 -- deny, review and configured failure decisions
     try:
         loaded = load_protected_paths()
     except (OSError, json.JSONDecodeError) as err:
@@ -193,20 +210,37 @@ def guard_before_tool_call(event: dict[str, Any]) -> dict[str, Any]:
     if not cfg["enabled"]:
         return {"block": False}
 
-    candidates = extract_paths_from_params(
-        event.get("toolName"), event.get("params"),
-        bash_like_tools=cfg.get("bashLikeTools") or [],
-    )
-    for candidate in candidates:
-        resolved = normalize_path(candidate)
+    try:
+        facts, paths = path_facts(event, bash_like_tools=cfg.get("bashLikeTools") or [])
+    except PathAnalysisIncomplete as exc:
+        return {"block": True, "outcome": "ask", "source": "path_guard:analysis",
+                "analysis": "indeterminate", "reason": str(exc)}
+    uncertain = not facts.complete
+    for path in paths:
+        candidate = path.value
+        if candidate is None:
+            uncertain = True
+            continue
+        resolved = normalize_path(candidate, event_cwd(event))
         hit = match_protected(resolved, rules) or match_protected(expand_home(candidate), rules)
+        if path.certainty != "access":
+            uncertain = True
+            continue
         if hit:
             return {
                 "block": True,
+                "outcome": "deny",
+                "source": "path_guard",
+                "evidence": {"origin": asdict(path.origin) if path.origin is not None else None,
+                             "field": list(path.field), "operation": path.operation},
                 "matched": hit["pattern"],
                 "candidate": candidate,
                 "resolved": resolved,
                 "severity": hit.get("severity"),
                 "reason": hit.get("reason"),
             }
+    if uncertain:
+        return {"block": True, "outcome": "ask", "source": "path_guard:analysis",
+                "analysis": "indeterminate", "reason": "Path access analysis incomplete",
+                "evidence": {"diagnostics": list(facts.errors)}}
     return match_learned("path_guard", event) or {"block": False}

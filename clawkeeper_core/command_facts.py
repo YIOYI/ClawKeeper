@@ -145,12 +145,22 @@ class DataSpan:
 
 
 @dataclass(frozen=True)
+class PathAccess:
+    value: str | None
+    operation: str
+    origin: Origin | None
+    certainty: str = "access"
+    field: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Analysis:
     sources: tuple[Source, ...]
     calls: tuple[Invocation, ...]
     pipelines: tuple[Pipeline, ...]
     diagnostics: tuple[Diagnostic, ...]
     data: tuple[DataSpan, ...] = ()
+    paths: tuple[PathAccess, ...] = ()
 
     @property
     def complete(self) -> bool:

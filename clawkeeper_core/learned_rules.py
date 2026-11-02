@@ -24,7 +24,7 @@ from clawkeeper_core.command_facts import FACT_VERSION, SUBJECTS
 from clawkeeper_core.execution import analysis_scope
 
 PROTOCOL_VERSION = 2
-VALIDATION_VERSION = 5
+VALIDATION_VERSION = 6
 TARGETS = frozenset({"exec_gate", "path_guard", "script_body_scan"})
 INSTANCE_ID = str(uuid.uuid4())
 _LOG = logging.getLogger(__name__)
@@ -249,12 +249,17 @@ def target_texts(target: str, event: dict, subject: str | None = None) -> list[s
             raise ValueError("execution context analysis incomplete")
         return [v for c in contexts for v in c.values(subject, script=target == "script_body_scan")]
     if target == "path_guard":
-        from clawkeeper_core.guards.path_guard import extract_paths_from_params, normalize_path  # noqa: PLC0415
+        from clawkeeper_core.guards.path_guard import (  # noqa: PLC0415
+            event_cwd,
+            extract_paths_from_params,
+            load_protected_paths,
+            normalize_path,
+        )
 
         return [
             p
-            for candidate in extract_paths_from_params(event.get("toolName"), params)
-            if (p := normalize_path(candidate))
+            for candidate in extract_paths_from_params(event.get("toolName"), params, bash_like_tools=load_protected_paths()["config"].get("bashLikeTools"))
+            if (p := normalize_path(candidate, event_cwd(event)))
         ]
     raise ValueError(f"unsupported guard target: {target!r}")
 

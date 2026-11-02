@@ -29,8 +29,11 @@ def run_case(root: Path, *, guarded: bool, trusted: bool = True, launcher: bool 
     work.mkdir()
     commands = [
         "printf CLAWKEEPER_SAFE > allowed.txt",
-        # Only prints a path. Even the unguarded control never reads secrets.
-        "printf '%s\\n' ~/.aws/credentials > blocked.txt",
+        # Path mentions are output data and should be allowed (#18).
+        "printf '%s\\n' ~/.aws/credentials > path-mention.txt",
+        # Unresolved executable text requires review; its unguarded effect is
+        # limited to writing this harmless fixture marker.
+        'CK_FIXTURE_SCRIPT="printf CLAWKEEPER_REVIEW > blocked.txt"; bash -c "$CK_FIXTURE_SCRIPT"',
     ]
     requests = []
 
@@ -144,14 +147,16 @@ def run_case(root: Path, *, guarded: bool, trusted: bool = True, launcher: bool 
         "prepared_launcher": guarded and launcher, "returncode": proc.returncode,
         "requests": len(requests),
         "safe_command_executed": (work / "allowed.txt").exists(),
-        "protected_path_command_executed": (work / "blocked.txt").exists(),
+        "path_mention_executed": (work / "path-mention.txt").exists(),
+        "unresolved_command_executed": (work / "blocked.txt").exists(),
         "clawkeeper_feedback_seen": any("[ClawKeeper]" in str(out) for out in tool_outputs),
     }
     print(json.dumps(result), flush=True)
     if proc.returncode != 0 or len(requests) != len(commands) + 1:
         raise RuntimeError(f"Codex fixture did not complete; inspect {work}")
     assert result["safe_command_executed"], result
-    assert result["protected_path_command_executed"] is (not (guarded and trusted)), result
+    assert result["path_mention_executed"], result
+    assert result["unresolved_command_executed"] is (not (guarded and trusted)), result
     assert result["clawkeeper_feedback_seen"] is (guarded and trusted), result
     return result
 
