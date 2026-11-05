@@ -242,6 +242,33 @@ def _recent_messages(agent: Any, n: int = 20) -> list:
     return history[-n:]
 
 
+def _user_text(content: Any) -> str:
+    if isinstance(content, list):
+        content = "\n".join(
+            block["text"] for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _stated_user_intent(agent: Any) -> str | None:
+    """Read user turns in order, retaining the original task and later revisions.
+
+    Use the full host-owned history rather than the Judge's recent-message
+    window: long tool trajectories must not discard the original constraints.
+    Assistant/tool text and non-text content blocks are not user authorization.
+    """
+    turns = []
+    for message in getattr(agent, "conversation_history", None) or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _user_text(message.get("content"))
+        if text:
+            turns.append(text)
+    return "\n\n".join(turns) or None
+
+
 def _with_rule_sync(callback, watcher_client, agent, blocked_result):
     if watcher_client is None:
         return callback
@@ -259,6 +286,22 @@ def _with_rule_sync(callback, watcher_client, agent, blocked_result):
     return synchronized
 
 
+def _same_agent_session(callback: Any, agent: Any) -> bool:
+    owner = getattr(callback, "_clawkeeper_agent", None)
+    return owner is agent or (
+        owner is not None
+        and str(getattr(owner, "session_id", "default")) == str(getattr(agent, "session_id", "default"))
+    )
+
+
+def _replace_session_hook(manager: Any, name: str, agent: Any, callback: Any = None) -> None:
+    hooks = manager._hooks.setdefault(name, [])
+    hooks[:] = [existing for existing in hooks if not _same_agent_session(existing, agent)]
+    if callback is not None:
+        callback._clawkeeper_agent = agent
+        hooks.append(callback)
+
+
 def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=None):
 
     """Register a Hermes plugin `pre_tool_call` hook that runs CK's guard chain.
@@ -274,7 +317,41 @@ def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=Non
         return
     manager = _ensure_plugins_discovered()
 
-    def ck_pre_tool_call(*, tool_name, args, task_id="", session_id="", tool_call_id=""):
+    # Hermes owns a process-global hook registry. Capture only this agent's
+    # original user input, before model/tool output can change its meaning.
+    # Keep it independently of Hermes's model-facing history/compression.
+    intents: dict[str, list[str]] = {}
+    session_key = str(getattr(agent, "session_id", "default"))
+
+    # Gateways can construct a fresh agent for each turn of the same session.
+    # Hand over captured input and replace its old hooks instead of consulting
+    # the Watcher once for every agent ever installed in that session.
+    for callback in manager._hooks.get("pre_llm_call", []):
+        if _same_agent_session(callback, agent):
+            previous = getattr(callback, "_clawkeeper_intents", {})
+            intents.update({
+                key: list(turns) for key, turns in previous.items()
+                if key == session_key or getattr(callback, "_clawkeeper_agent", None) is agent
+            })
+
+    def capture_user_intent(*, user_message, session_id="", **_kwargs):
+        if not session_id or str(session_id) != str(getattr(agent, "session_id", "default")):
+            return None
+        text = _user_text(user_message)
+        if text:
+            key = str(session_id)
+            if key not in intents:
+                previous = _stated_user_intent(agent)
+                intents[key] = [previous] if previous else []
+            if not intents[key] or intents[key][-1] != text:
+                intents[key].append(text)
+
+    capture_user_intent._clawkeeper_intents = intents
+    _replace_session_hook(
+        manager, "pre_llm_call", agent, capture_user_intent if watcher_client is not None else None
+    )
+
+    def ck_pre_tool_call(*, tool_name, args, task_id="", session_id="", tool_call_id="", **_kwargs):
         command = ""
         if isinstance(args, dict):
             command = str(args.get("command") or args.get("url") or "")
@@ -303,10 +380,12 @@ def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=Non
 
         if watcher_client is not None:
             try:
+                key = str(getattr(agent, "session_id", "default"))
                 d = watcher_client.evaluate(
-                    session_id=str(getattr(agent, "session_id", "default")),
+                    session_id=key,
                     tool_name=str(tool_name),
                     args=args if isinstance(args, dict) else {},
+                    stated_intent="\n\n".join(intents[key]) if key in intents else _stated_user_intent(agent),
                 )
                 _record_decision(
                     agent,
@@ -326,10 +405,18 @@ def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=Non
 
         return None
 
-    manager._hooks.setdefault("pre_tool_call", []).append(_with_rule_sync(
+    synchronized = _with_rule_sync(
         ck_pre_tool_call, watcher_client, agent,
         {"action": "block", "message": "[ClawKeeper:watcher] Rule synchronization failed; ask operator"},
-    ))
+    )
+
+    def scoped_pre_tool_call(**kwargs):
+        session_id = kwargs.get("session_id", "")
+        if session_id and str(session_id) != str(getattr(agent, "session_id", "default")):
+            return None
+        return synchronized(**kwargs)
+
+    _replace_session_hook(manager, "pre_tool_call", agent, scoped_pre_tool_call)
 
 
 def _register_observers(

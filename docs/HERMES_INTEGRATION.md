@@ -37,6 +37,32 @@ install_clawkeeper(judge, agent)
 agent.run(user_prompt="Refactor the auth module.")
 ```
 
+With `install_clawkeeper(judge, agent, watcher_url="http://127.0.0.1:9099")`,
+the adapter captures the original `user_message` from Hermes's `pre_llm_call`
+hook before tools run, and sends it as `stated_intent` with each Watcher
+evaluation. It keeps user turns in chronological order per session, preserving
+the original task and constraints alongside later revisions even if the
+model-facing history is compressed or rewritten within the same session ID. The hook's model-facing
+`conversation_history` is not used as a source of new user authorization.
+
+For hosts that expose an agent-level `conversation_history`, its user messages
+provide a fallback until input is captured from the turn hook, and seed earlier
+context on the first captured turn. The host must preserve message roles so
+that only actual user input is marked `user`. Assistant and tool messages are
+excluded; multimodal messages contribute only their text blocks. With no user
+text available, the adapter leaves `stated_intent` unset, preserving any intent
+explicitly registered with the Watcher.
+
+Process-global hooks ignore events carrying another session's ID. Reinstalling
+for the same agent or replacing it with a new agent for the same session
+replaces the previous ClawKeeper plugin hooks and retains captured user input,
+so each proposed call is evaluated once. Hosts must provide distinct session
+IDs for independent conversations.
+
+If Hermes rotates `session_id` during compression, the new ID is treated as a
+separate Watcher session. Migrating user intent and tool history across session
+IDs is outside this integration's current scope.
+
 ## Install footprint
 
 Hermes' `pyproject.toml` exact-pins its core deps (including
