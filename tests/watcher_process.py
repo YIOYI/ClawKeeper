@@ -50,7 +50,7 @@ def run_server(store_path, descriptor):
     from clawkeeper_core.watcher.tools import SessionHistory
 
     store = learner.LearnedPatternStore(Path(store_path))
-    for module in (agent, daemon, learner, reload):
+    for module in (daemon, learner, reload):
         module.STORE = store
 
     class Model:

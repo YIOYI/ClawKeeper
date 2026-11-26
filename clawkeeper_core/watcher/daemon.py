@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -26,8 +27,15 @@ from clawkeeper_core.bounded_regex import MAX_PATTERN_CHARS
 from clawkeeper_core.learned_rules import INSTANCE_ID, current_snapshot, policy_error
 from clawkeeper_core.watcher.agent import Watcher, WatcherDecision
 from clawkeeper_core.watcher.dashboard import DASHBOARD_HTML
-from clawkeeper_core.watcher.learner import STORE, StoreUnavailableError, scrub_sample
-from clawkeeper_core.watcher.reload import apply_learned_patterns
+from clawkeeper_core.watcher.learner import (
+    STORE,
+    AmbiguousPatternError,
+    PatternCandidate,
+    StoreUnavailableError,
+    scrub_sample,
+    stored_rule_id,
+)
+from clawkeeper_core.watcher.reload import apply_learned_patterns, remove_learned_pattern
 
 # ── Live event bus (SSE broadcast) ─────────────────────────────────────────
 _event_bus: list[asyncio.Queue] = []
@@ -64,6 +72,23 @@ class EvaluateResponse(BaseModel):
 class IntentRequest(BaseModel):
     session_id: str
     intent: str
+
+
+def _listed_rule(c: PatternCandidate) -> dict:
+    def text(value):
+        if isinstance(value, str):
+            return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+        return None
+
+    confidence = c.confidence
+    return {
+        "id": stored_rule_id(c.guard_target, c.pattern, c.subject),
+        "pattern": text(scrub_sample(c.pattern)) if isinstance(c.pattern, str) and len(c.pattern) <= MAX_PATTERN_CHARS else "[rejected]",
+        "guard_target": text(c.guard_target), "subject": text(c.subject),
+        "confidence": confidence if type(confidence) is int or (type(confidence) is float and math.isfinite(confidence)) else None,
+        "inactive_reason": text(c.inactive_reason), "created_at": text(c.created_at),
+        "source_command": "", "source_args": None,
+    }
 
 
 def build_app(watcher: Watcher | None = None) -> FastAPI:  # noqa: PLR0915 -- route registrations
@@ -195,21 +220,17 @@ def build_app(watcher: Watcher | None = None) -> FastAPI:  # noqa: PLR0915 -- ro
             candidates = STORE.all()
         except StoreUnavailableError as exc:
             raise HTTPException(status_code=503, detail="learned store unavailable") from exc
-        return [{"pattern": scrub_sample(c.pattern) if isinstance(c.pattern, str) and len(c.pattern) <= MAX_PATTERN_CHARS else "[rejected]",
-                 "guard_target": c.guard_target, "confidence": c.confidence,
-                 "subject": c.subject, "inactive_reason": c.inactive_reason,
-                 "created_at": c.created_at, "source_command": "",
-                 "source_args": None} for c in candidates]
+        return [_listed_rule(c) for c in candidates]
 
     @app.delete("/watcher/learned/{pattern_hash}")
-    def remove_learned(pattern_hash: str):
+    def remove_learned(pattern_hash: str, exact: bool = False):
         try:
-            removed = STORE.remove(pattern_hash)
-        except StoreUnavailableError as exc:
-            raise HTTPException(status_code=503, detail="learned store unavailable") from exc
-        if removed:
-            apply_learned_patterns()
-        return {"removed": removed}
+            removed, version, error = remove_learned_pattern(pattern_hash, exact=exact)
+        except AmbiguousPatternError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result = {"removed": removed, "watcher_runtime": "retained" if error else "synchronized",
+                  "version": version, "error": error}
+        return JSONResponse(result, status_code=503 if error else 200)
 
     return app
 

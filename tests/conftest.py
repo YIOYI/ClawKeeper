@@ -26,9 +26,9 @@ def isolated_rule_runtime(monkeypatch):
 
 @pytest.fixture
 def isolated_learning(tmp_path, monkeypatch):
-    from clawkeeper_core.watcher import agent, daemon, learner, reload
+    from clawkeeper_core.watcher import daemon, learner, reload
 
     store = learner.LearnedPatternStore(tmp_path / "learned.json")
-    for module in (agent, daemon, learner, reload):
+    for module in (daemon, learner, reload):
         monkeypatch.setattr(module, "STORE", store)
     return store
