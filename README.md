@@ -95,225 +95,25 @@ install_clawkeeper(
 )
 ```
 
-## Test Codex CLI hooks (experimental)
-
-`examples/codex_pre_tool_use.py` is a minimal shell-only `PreToolUse` hook.
-It runs the existing execution, protected-path, URL, and script-body guards
-in-process. A denial uses Codex's hook response format; safe calls leave
-Codex's normal permissions and sandbox in place. It does not use the HTTP
-server or Watcher, and does not scan tool results or chat messages.
-
-Test the real CLI without changing your active Codex configuration:
-
-```bash
-uv run --extra dev python examples/codex_hook_smoke.py
-```
-
-The smoke test needs a local Codex CLI with hook support (verified on 0.162.1)
-and permission to bind a loopback port. It uses a deterministic local Responses
-fixture, temporary files, and invocation-only configuration. It makes no
-external model requests and never reads actual credentials. It verifies an
-unguarded control, hooks skipped pending trust, and guarded native shell calls.
-Only the guarded test invocation uses `--dangerously-bypass-hook-trust` for the
-reviewed fixture; no persisted trust or global hook configuration is changed.
-
-For this checkout, start a separate interactive CLI with the prepared
-invocation-only configuration:
-
-```bash
-bash examples/start_codex_guarded.sh
-```
-
-The launcher starts Codex with `--no-daemon`, keeps the native workspace-write
-sandbox and on-request approvals, and passes `examples/codex_hook_override.toml`
-using `--config`. It inherits your normal account/model settings. It writes
-neither user nor project hook configuration, so the current conversation and
-ordinary `codex` launches do not gain this hook. The prepared TOML contains
-absolute paths for this checkout; update them if you move the repository.
-
-Before submitting tasks in the new CLI, open `/hooks`, inspect the `PreToolUse`
-entry whose command runs `codex_pre_tool_use.py`, and trust that definition.
-If the CLI asks you to restart after trust review, close it and run the same
-launcher again. The launcher never bypasses hook trust. To check protection
-without reading secrets, ask the new agent to run `printf CLAWKEEPER_OK`, then
-`printf '%s\\n' ~/.aws/credentials`. The first should execute; the second
-should be denied with a `[ClawKeeper]` reason. Exit this CLI and start ordinary
-`codex` to omit the invocation-only hook.
-
-To continue a saved conversation with the hook configured again, use the
-launcher for resume too:
-
-```bash
-bash examples/start_codex_guarded.sh resume <SESSION_ID>
-```
-
-Or use `resume --last` to continue the most recent session. Conversation
-history and invocation-only hook configuration are separate; check `/hooks`
-after reopening the conversation before relying on protection.
-
-For a persistent installation, merge this entry into your Codex `hooks.json`
-using absolute, quoted paths for your checkout and virtual environment:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "^Bash$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"/absolute/path/ClawKeeper/.venv/bin/python\" \"/absolute/path/ClawKeeper/examples/codex_pre_tool_use.py\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Review and trust the definition with `/hooks` in a separate Codex session.
-Project hooks also require a trusted project. Merely writing a hook file does
-not activate protection. The prototype denies malformed input and guard
-exceptions, but runtime failures outside the script (missing interpreter,
-timeout, skipped/untrusted hook) are subject to Codex's own behavior. Hosted
-tools and subsequent input to an existing `write_stdin` session are outside
-this shell-only hook's coverage. See the [official hook documentation](https://learn.chatgpt.com/docs/hooks).
-
 ## Core guards
 
-The default guard set currently covers:
+ClawKeeper checks commands locally before a tool runs them. It blocks known
+dangerous commands and pauses the tool call for review when it cannot determine
+what would run. Keep your host's permissions and sandbox enabled.
 
-- dangerous shell execution
-- protected path access
+The default guards also check for:
+
+- protected file access, including paths used in scripts
 - unsafe URL / SSRF patterns
-- script-body and dynamic-path inspection
 - base64/hex encoded payloads
-- credential discovery plus network exfiltration chains
-- poisoned return content
-- credential redaction
+- credential discovery followed by network exfiltration
 
-The exact policies are intentionally small and inspectable; see `clawkeeper_core/guards/`.
+After a tool runs, ClawKeeper scans its results for malicious instructions and
+redacts recognized credentials.
 
-## Command execution gate
-
-The execution gate runs locally and makes no model calls. Built-in command
-patterns are scoped to the program called in each shell segment. Text in an
-`echo` argument, a comment, a Python string, or a normal file-write payload is
-not treated as a shell program invocation. The gate checks each executable
-field independently, and log scanning uses the same context-aware detector.
-
-The analyzer uses upstream tree-sitter for Bash syntax and Python's `ast` for
-inline Python, Python heredocs and literal here-strings. It follows command substitutions, literal
-shell `-c` bodies, common literal `os.system`/`subprocess` calls (including import
-aliases and explicit `subprocess` executable overrides), and supported wrappers
-such as `sudo`, `env`, and `command`. Redirections survive wrapper unwrapping,
-and pipeline analysis preserves redirected and grouped stages. Ordinary dynamic
-data arguments after a known wrapper target remain data; dynamic program names
-and code operands require review. Process substitutions supplying executable
-source also require review. Each
-built-in pattern declares its executable scope; a clean segment cannot exempt
-another segment. Existing rule IDs and risk policies, including the restriction
-on actual `whoami`/`ver` calls, are preserved.
-
-Malformed syntax, unresolved executable text, unsupported inline languages,
-and source/node/depth limits produce `block=true`, `outcome=ask`, and
-`analysis=indeterminate`. This pauses the call through existing adapters; it is
-not a claim that a known dangerous command was found. PowerShell code is not
-fully parsed; PowerShell interpreter invocations require review. Simple literal
-`cmd /c` calls are inspected, but this is not a complete Cmd parser.
-
-All 49 built-in patterns use executable scopes. Built-in and learned checks
-share the same extraction and syntax analysis. Execution fields such as
-`command`, `cmd`, `script`, `code`, and nested execution envelopes are examined
-regardless of the tool name. Descriptions, headers, environment metadata, and
-file `content` are treated as data for command analysis. Generic `input` fields
-are checked for visible operations. A syntax error in that field alone does not
-establish shell execution. The guards inspect
-the call parameters visible to the host, including any inline source; they
-cannot inspect actions taken inside a separate MCP server.
-
-Parsing now produces immutable facts: original source documents, UTF-8 byte
-ranges, argument values/roles, nested code origins, pipeline stages and effective
-stdin. Guards, log scanning, learning and explanations consume this same model.
-A guard-chain scope parses each distinct input once; facts expire at the end of
-that evaluation. Changed inputs invalidate the scoped cache. No model is called
-by this assessment path.
-
-New learned rules select a semantic `subject`: `program.name`, `python.module`,
-`script.path`, `python.operation` or `path`. Names use full matching; paths use
-search. The `invocation` subject preserves the earlier executable-first matching
-projection for rules that need several arguments. Synthesis, validation, reload
-and enforcement use the same field selectors. Path checks consume parsed access
-operands and explicit file-tool path fields,
-excluding output data and document contents. Python tracks bounded literal
-assignments, path joins and visible loop values; script checks use those same
-access facts instead of a character-distance window. Unknown file operands or
-unsupported execution contexts request review. Relative operands use the event's
-`cwd` (or `params.cwd`/`workdir`/`working_directory`); relative access following a
-directory change requires review. This is not arbitrary Python data-flow
-analysis or a filesystem sandbox.
-
-Source samples carry a subject and schema version. Legacy raw samples are
-reparsed; version-3 bare program samples migrate to `program.name` so an anchored
-`node$` rule still matches `node script.js`. Incompatible samples stay inactive
-with an inspectable reason. Version-4 invocation samples retain their projection.
-Pre-validator-6 normalized path samples lack access provenance and become
-inactive with a relearning reason; their historical IDs remain deletable. Legacy
-records that retain tool arguments are reanalyzed before activation.
-Protocol **2**, validator **6**, and subject schema **1** prevent silently mixing
-matching semantics; upgrade Watcher and adapters together. Immutable snapshots,
-atomic replacement, deletions (including legacy IDs) and restart synchronization
-from issues #7/#8 remain covered by tests.
-
-For HTTP tools, use the connection-enforcing client inside the tool handler:
-
-```python
-from clawkeeper_core.network import public_http_client
-
-with public_http_client() as client:
-    response = client.get("https://example.com/docs")
-    response.raise_for_status()
-    text = response.text
-```
-
-Every new connection resolves and checks all IPv4/IPv6 answers, connects directly
-to a validated numeric address and verifies the peer. Redirect requests use the
-same policy, including same-host reconnects; DNS failures and mixed public/private
-answers fail closed. The original hostname remains the HTTP Host and TLS SNI,
-with certificate verification enabled. Environment proxies are disabled.
-`UnsafeDestination` is a transport error and should be surfaced as a refused
-fetch. Async hosts can call this synchronous client in a worker thread.
-
-`url_safety_guard` remains an offline text check: it does not resolve DNS or
-control a host's curl, browser or independent HTTP client. Such tools need this
-transport at their actual fetch boundary or host-level egress isolation. Installing
-a pre-tool guard alone does not provide network isolation. See
-[the supported boundaries and verification](docs/security-boundaries.md).
-
-Inspect a proposed call without running it or invoking a Judge:
-
-```bash
-python -m clawkeeper_core.execution 'echo whoami'
-python -m clawkeeper_core.execution 'bash -c whoami'
-python -m clawkeeper_core.execution 'bash -c "$SOURCE"'
-```
-
-The JSON output contains the real guard-chain decision (`allow`/`deny`/`ask`),
-facts, source ranges, diagnostics and pinned rule version. Recognized secrets
-are masked while preserving byte offsets. Use `--event-stdin` for a JSON tool
-event and `--rules-snapshot exported-rules.json` to replay an exported
-`GET /watcher/rules` snapshot; this never reads or migrates the live learned store.
-The installed entry point is `clawkeeper-explain`.
-
-This is bounded static detection, not a sandbox or a proof of arbitrary program
-safety. It does not follow external scripts, runtime aliases, arbitrary Python
-data flow, or executable files on disk. Keep the host's permissions and sandbox
-enabled. Some valid Bash redirection forms exceed the upstream grammar or fail
-its descriptor-boundary checks; these require review. Regression tests pair
-inert data with actual calls and use generated quoting/wrapper transformations;
-only fixed benign `printf` probes execute to cross-check shell stdin semantics.
+The URL guard checks addresses in tool requests. To restrict where a tool can
+connect, use a tool that enforces destination checks or configure outbound
+network restrictions on the host. See [security boundaries](docs/security-boundaries.md).
 
 ## Development
 
