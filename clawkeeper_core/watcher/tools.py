@@ -12,13 +12,9 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
-from clawkeeper_core.adapters.base import make_event
+from clawkeeper_core.adapters.base import DEFAULT_PRE_TOOL_GUARDS, make_event
 from clawkeeper_core.guards.credential_redact import credential_redact_guard  # noqa: F401
-from clawkeeper_core.guards.exec_gate import guard_execution
-from clawkeeper_core.guards.path_guard import guard_before_tool_call
 from clawkeeper_core.guards.return_content_scan import return_content_scan_guard  # noqa: F401
-from clawkeeper_core.guards.script_body_scan import script_body_scan_guard
-from clawkeeper_core.guards.url_safety import url_safety_guard
 from clawkeeper_core.learned_rules import pin_snapshot
 
 # ── Per-session call history ───────────────────────────────────────────────
@@ -70,12 +66,7 @@ HISTORY = SessionHistory()
 # ── Run deterministic guards and collect their findings ────────────────────
 
 
-_PRE_TOOL_GUARDS = (
-    guard_execution,
-    guard_before_tool_call,
-    script_body_scan_guard,
-    url_safety_guard,
-)
+_PRE_TOOL_GUARDS = DEFAULT_PRE_TOOL_GUARDS
 
 
 def classify_finding(decision: Any) -> str:  # noqa: PLR0911 -- explicit guard result categories
@@ -116,17 +107,10 @@ def _gather_findings(*, tool_name: str, args: dict | None) -> list[dict]:
 
     Findings are dicts in the standard guard-decision shape. Empty list = clean.
     """
-    command = ""
-    params_dict: dict[str, Any] = {}
-    if isinstance(args, dict):
-        params_dict = dict(args)
-        command = str(args.get("command") or args.get("url") or "")
-    elif args is not None:
-        command = str(args)
     event = make_event(
         tool_name=tool_name,
-        command=command,
-        params=params_dict,
+        command=args if isinstance(args, str) else "",
+        params=args if isinstance(args, dict) else {},
         direction="pre_tool_call",
     )
     out: list[dict] = []

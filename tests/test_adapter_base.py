@@ -8,6 +8,7 @@ from clawkeeper_core.adapters.base import (
     BaseAdapter,
     make_event,
     run_guard_chain,
+    run_pre_tool_guards,
 )
 
 
@@ -63,6 +64,14 @@ def test_chain_does_not_propagate_guard_exceptions():
     assert blocking is None
     sources = [d["source"] for d in all_decisions]
     assert "test:allow_all" in sources
+
+
+def test_pre_tool_guard_errors_pause_and_cannot_hide_a_deny():
+    event = make_event(tool_name="custom_runner", command="cat ~/.aws/credentials")
+    review, _ = run_pre_tool_guards(event, [_broken_guard, _allow_all_guard])
+    assert review["outcome"] == "ask"
+    deny, _ = run_pre_tool_guards(event, [_broken_guard, _deny_aws_guard])
+    assert deny["outcome"] == "deny"
 
 
 def test_make_event_shape():

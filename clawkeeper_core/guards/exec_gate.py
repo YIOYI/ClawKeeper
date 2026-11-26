@@ -35,7 +35,8 @@ _CONTENT_TOOLS = {
     "grep",
 }
 _COMMAND_FIELDS = ("command", "cmd", "script", "input", "code", "bash", "shell")
-_PYTHON_TOOLS = {"python", "python_exec", "run_python"}
+_EXECUTION_FIELDS = frozenset((*_COMMAND_FIELDS, "payload"))
+_DATA_FIELDS = {"env", "environment", "headers", "metadata", "description", "body", "content"}
 
 
 def _build_default_gate() -> dict[str, Any]:
@@ -132,19 +133,12 @@ def extract_command_text(
 def extract_execution_requests(
     tool_name: Any, params: Any, bash_like_tools: list[str] | None = None
 ) -> list[tuple[str, str]]:
-    return [(language, source) for language, source, _ in _execution_requests(tool_name, params, bash_like_tools)]
+    """Extract executable fields. The old tool hints are accepted for API compatibility."""
+    return [(language, source) for language, source, _ in _execution_requests(params)]
 
 
-def _execution_requests(tool_name, params, bash_like_tools=None):
-    """Do not concatenate independent executable fields or scan metadata."""
-    t = str(tool_name or "").lower()
-    if t in _CONTENT_TOOLS:
-        return []
-    p = params if isinstance(params, dict) else {}
-    shell_tool = t in {"sh", "zsh", "ksh", "spawn"} or bool(_BASH_LIKE_HINT_RE.search(t))
-    shell_tool |= t in {s.lower() for s in (bash_like_tools or [])}
-    fields = _COMMAND_FIELDS if shell_tool or t in _PYTHON_TOOLS else ("command", "cmd", "script")
-    language = "python" if t in _PYTHON_TOOLS else "shell"
+def _execution_requests(params):
+    """Keep executable fields separate and classify them without tool names."""
     # Preserve the generic/nested execution envelopes used by #7/#8 without
     # interpreting arbitrary description, header or environment strings as code.
     remaining = 10_000
@@ -157,9 +151,10 @@ def _execution_requests(tool_name, params, bash_like_tools=None):
             raise ValueError("execution envelope budget exhausted")
         if isinstance(value, dict):
             for key, child in value.items():
-                if key in {"env", "environment", "headers", "metadata", "description", "body"}:
+                if key in _DATA_FIELDS:
                     continue
-                if key in {*fields, "payload"} and isinstance(child, str) and child.strip():
+                if key in _EXECUTION_FIELDS and isinstance(child, str) and child.strip():
+                    language = "source" if key in {"command", "cmd", "code", "script"} else "shell"
                     yield language, child, (*path, key)
                 elif isinstance(child, (dict, list)):
                     yield from nested(child, (*path, str(key)))
@@ -167,7 +162,7 @@ def _execution_requests(tool_name, params, bash_like_tools=None):
             for index, child in enumerate(value):
                 yield from nested(child, (*path, str(index)))
 
-    return list(nested(p))
+    return list(nested(params)) if isinstance(params, dict) else []
 
 
 def execution_contexts(event: dict[str, Any]):

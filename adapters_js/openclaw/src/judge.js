@@ -8,7 +8,7 @@
 /**
  * Forward a JS-style judge payload to the Python core.
  *
- * @param {object} payload  - { mode, requestId, forwardedContext, policy }
+ * @param {object} payload  - { mode, requestId, forwardedContext, toolCall, policy }
  * @param {object} options  - { serverUrl, failurePolicy, timeoutMs }
  * @returns {Promise<object>} The parsed Decision dict from the server.
  *   On failure honours options.failurePolicy:

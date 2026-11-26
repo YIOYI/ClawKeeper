@@ -756,10 +756,41 @@ def analyze_python(source: str) -> Analysis:
     return result.freeze()
 
 
+def _looks_like_python_source(source: str, remaining_bytes: int, *, prefer_shell: bool) -> bool:
+    """Recognize Python syntax in generic source fields; bare words stay shell."""
+    data = source.encode()
+    if len(data) > remaining_bytes:
+        return False
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    # A bare expression such as a program name can still be a shell call.
+    if any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Name, ast.BinOp))
+           for stmt in tree.body):
+        return False
+    if any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) for stmt in tree.body):
+        return True
+    python_syntax = any(
+        isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign,
+                          ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.With, ast.For,
+                          ast.While, ast.If, ast.Try, ast.Raise, ast.Assert, ast.AugAssign))
+        for stmt in tree.body
+    )
+    if not python_syntax:
+        return False
+    return not prefer_shell or Parser(_LANGUAGE).parse(data).root_node.has_error
+
+
 def analyze_requests(requests: list[tuple[str, str, tuple[str, ...]]]) -> Analysis:
     """All executable fields in an event share source, node and byte budgets."""
     result = CommandAnalysis()
     for language, source, path in requests:
         result.field = path
-        (_python if language == "python" else _shell)(source, result, 0)
+        if language == "python" or (language == "source" and _looks_like_python_source(
+            source, result._bytes, prefer_shell=path[-1] in {"command", "cmd"},
+        )):
+            _python(source, result, 0)
+        else:
+            _shell(source, result, 0)
     return result.freeze()

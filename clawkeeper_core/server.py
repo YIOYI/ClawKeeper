@@ -18,15 +18,18 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from clawkeeper_core import __version__
+from clawkeeper_core.adapters.base import make_event, run_pre_tool_guards
 from clawkeeper_core.audit import create_audit_context, run_audit
-from clawkeeper_core.judge import Judge
+from clawkeeper_core.judge import Judge, decision_from_guard
 from clawkeeper_core.maintenance import harden, rollback
 from clawkeeper_core.scanner import scan_logs_for_security_risks, scan_skill
 
@@ -45,6 +48,12 @@ def health() -> dict[str, str]:
 # ── Judge ──────────────────────────────────────────────────────────────────
 
 
+class ProposedToolCall(BaseModel):
+    toolName: str = ""
+    params: dict[str, Any]
+    cwd: str | None = None
+
+
 class JudgePayload(BaseModel):
     """Flexible JSON shape mirroring the JS `judgeForwardedContext` input.
 
@@ -59,11 +68,49 @@ class JudgePayload(BaseModel):
     requestId: str | None = None
     forwardedContext: dict[str, Any] | None = None
     policy: dict[str, Any] | None = None
+    toolCall: ProposedToolCall | None = None
+
+
+def _legacy_tool_call(messages: Any) -> ProposedToolCall | None:
+    """Older adapters append the proposed call as a terminal tool message with raw arguments."""
+    if not isinstance(messages, list) or not messages or not isinstance(messages[-1], dict):
+        return None
+    message = messages[-1]
+    if message.get("role") != "tool" or "result" in message or "error" in message:
+        return None
+    raw = message.get("raw")
+    if isinstance(raw, str) and raw.strip():
+        # Legacy OpenClaw sent a JSON object, while other callers sent a shell string.
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+        raw = decoded if isinstance(decoded, dict) else {"command": raw}
+    if not isinstance(raw, dict):
+        return None
+    name = message.get("toolName", message.get("name"))
+    return ProposedToolCall(toolName=name if isinstance(name, str) else "", params=raw)
 
 
 @app.post("/v1/judge")
 async def judge(payload: JudgePayload) -> dict[str, Any]:
-    return await _judge.evaluate_async(payload.model_dump(exclude_none=False))
+    request = payload.model_dump(exclude_none=True)
+    context = payload.forwardedContext or {}
+    messages = context.get("messages")
+    call = payload.toolCall or _legacy_tool_call(messages)
+    if call is not None:
+        event = make_event(tool_name=call.toolName, params=call.params)
+        if call.cwd is not None:
+            event["cwd"] = call.cwd
+        blocking, _ = await run_in_threadpool(run_pre_tool_guards, event)
+        if blocking is not None:
+            return decision_from_guard(blocking, payload.mode or "local")
+    if payload.toolCall is not None:
+        history = messages if isinstance(messages, list) else []
+        request["forwardedContext"] = {
+            **context, "messages": [*history, {"role": "tool", "toolName": payload.toolCall.toolName}],
+        }
+    return await _judge.evaluate_async(request)
 
 
 # ── Event (fire-and-forget telemetry) ──────────────────────────────────────

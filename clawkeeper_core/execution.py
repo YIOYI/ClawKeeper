@@ -34,11 +34,10 @@ def analysis_scope():
 
 def analyze_event(event: dict, *, bash_like_tools: list[str] | None = None) -> Analysis:
     from clawkeeper_core.guards.command_context import analyze_requests  # noqa: PLC0415
-    from clawkeeper_core.guards.exec_gate import _execution_requests, load_exec_gate  # noqa: PLC0415
+    from clawkeeper_core.guards.exec_gate import _execution_requests  # noqa: PLC0415
 
     try:
-        requests = _execution_requests(event.get("toolName"), event.get("params"),
-                                       [*load_exec_gate()["config"]["bashLikeTools"], *(bash_like_tools or [])])
+        requests = _execution_requests(event.get("params"))
         key = tuple(requests)
         cache = _analyses.get()
         if cache is not None and key in cache:
@@ -84,15 +83,11 @@ def evaluate_execution(event: dict, loaded: dict) -> dict:
 
 def explain(event: dict) -> dict:
     """Replay the real pre-tool guard chain with its pinned policy and facts."""
-    from clawkeeper_core.adapters.base import run_guard_chain  # noqa: PLC0415
-    from clawkeeper_core.guards.exec_gate import guard_execution  # noqa: PLC0415
-    from clawkeeper_core.guards.path_guard import guard_before_tool_call  # noqa: PLC0415
-    from clawkeeper_core.guards.script_body_scan import script_body_scan_guard  # noqa: PLC0415
-    from clawkeeper_core.guards.url_safety import url_safety_guard  # noqa: PLC0415
+    from clawkeeper_core.adapters.base import run_pre_tool_guards  # noqa: PLC0415
     from clawkeeper_core.learned_rules import pin_snapshot  # noqa: PLC0415
 
     with analysis_scope(), pin_snapshot() as snapshot:
-        block, findings = run_guard_chain([guard_execution, guard_before_tool_call, script_body_scan_guard, url_safety_guard], event)
+        block, findings = run_pre_tool_guards(event)
         facts = analyze_event(event)
         decision = "allow" if block is None else block.get("outcome", "deny")
         result = {"decision": decision, "fact_version": FACT_VERSION, "rules_version": snapshot.version,

@@ -33,31 +33,26 @@ export const clawkeeperShimPlugin = {
     };
     const mode = config.mode || "local";
 
-    api.on("before_tool_call", async (event) => {
+    api.on("before_tool_call", async (event, context) => {
+      const toolName = event?.toolName || event?.name || "";
+      const params = typeof event?.params === "string"
+        ? { command: event.params }
+        : event?.params ?? {};
       const payload = {
         mode,
-        requestId: event?.requestId || event?.callId,
+        requestId: event?.requestId || event?.toolCallId || event?.callId,
+        toolCall: { toolName, params, cwd: context?.cwd ?? event?.cwd },
         forwardedContext: {
-          messages: _buildMessagesFromEvent(event),
-          metadata: { sessionKey: event?.sessionKey },
+          messages: _recentMessages(event),
+          metadata: { sessionKey: context?.sessionKey ?? event?.sessionKey },
         },
       };
       const decision = await judge(payload, options);
 
-      if (decision?.decision === "stop") {
+      if (decision?.decision === "stop" || decision?.decision === "ask_user") {
         return {
           block: true,
-          reason: decision.summary || decision.stopReason,
-          severity: decision.riskLevel,
-          source: "clawkeeper-shim",
-        };
-      }
-      if (decision?.decision === "ask_user") {
-        return {
-          ask: true,
-          question: decision.userQuestion || decision.summary,
-          severity: decision.riskLevel,
-          source: "clawkeeper-shim",
+          blockReason: decision.userQuestion || decision.summary || decision.stopReason,
         };
       }
       return { block: false };
@@ -73,16 +68,10 @@ export const clawkeeperShimPlugin = {
  * gave us. The plugin SDK has evolved over time; defensively support
  * both `event.messages` and `event.history`.
  */
-function _buildMessagesFromEvent(event) {
+function _recentMessages(event) {
   if (!event) return [];
   const history = event.messages || event.history || event.conversationHistory || [];
-  const recent = Array.isArray(history) ? history.slice(-20) : [];
-  const toolCall = {
-    role: "tool",
-    toolName: event.toolName || event.name,
-    raw: typeof event.params === "object" ? JSON.stringify(event.params) : String(event.params ?? ""),
-  };
-  return [...recent, toolCall];
+  return Array.isArray(history) ? history.slice(-20) : [];
 }
 
 

@@ -56,19 +56,43 @@ def test_judge_missing_input(client):
     assert r.json()["stopReason"] == "missing_input"
 
 
-def test_judge_dangerous_tool_asks_user(client):
-    r = client.post("/v1/judge", json={
-        "mode": "remote",
-        "forwardedContext": {
-            "messages": [
-                {"role": "user", "content": "deploy"},
-                {"role": "tool", "toolName": "bash"},
-            ],
-        },
+@pytest.mark.parametrize("name", ["bash", "terminal", "custom_runner", "read_file", "write"])
+@pytest.mark.parametrize(("params", "decision", "guard"), [
+    ({"command": "ls -la"}, "continue", None),
+    ({"request": {"cmd": "whoami"}}, "stop", "exec_gate"),
+    ({"input": "whoami"}, "stop", "exec_gate"),
+    ({"command": "whoami"}, "stop", "exec_gate"),
+    ({"path": "/etc/shadow"}, "stop", "path_guard"),
+    ({"code": "open('/tmp/example/.docker/config.json').read()"}, "stop", "script_body_scan"),
+    ({"url": "http://127.0.0.1/"}, "stop", "url_safety"),
+    ({"command": "printf 'unfinished"}, "ask_user", "exec_gate"),
+    ({"path": "/tmp/example", "content": {"command": "whoami"}}, "continue", None),
+])
+def test_judge_http_checks_content_independent_of_tool_name(client, name, params, decision, guard):
+    response = client.post("/v1/judge", json={
+        "toolCall": {"toolName": name, "params": params},
     })
-    body = r.json()
-    assert body["decision"] == "ask_user"
-    assert body["stopReason"] == "waiting_user_confirmation"
+    body = response.json()
+    assert body["decision"] == decision
+    assert body["shouldContinue"] is (decision == "continue")
+    if guard:
+        assert any(item.startswith(f"guard={guard}") for item in body["evidence"])
+
+
+@pytest.mark.parametrize("raw", ["whoami", '{"command":"whoami"}'])
+def test_legacy_proposed_tool_raw_is_checked(client, raw):
+    response = client.post("/v1/judge", json={"forwardedContext": {"messages": [
+        {"role": "tool", "toolName": "custom_runner", "raw": raw},
+    ]}})
+    assert response.json()["stopReason"] == "guard_blocked"
+
+
+def test_structured_call_does_not_recheck_history(client):
+    response = client.post("/v1/judge", json={
+        "forwardedContext": {"messages": [{"role": "tool", "toolName": "bash", "raw": "whoami"}]},
+        "toolCall": {"toolName": "terminal", "params": {"command": "ls -la"}},
+    })
+    assert response.json()["decision"] == "continue"
 
 
 def test_judge_accepts_extra_fields(client):

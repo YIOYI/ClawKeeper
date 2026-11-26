@@ -107,12 +107,15 @@ def test_invalid_sync_preserves_previous_snapshot(failure):
         ("script_body_scan", "CK_CANARY_8421"),
     ],
 )
-def test_shared_client_for_both_hermes_interceptors(monkeypatch, target, command):
+def test_hermes_interceptors_share_client_and_preserve_host_callbacks(monkeypatch, target, command):
     from clawkeeper_core.adapters.hermes import install
+    from clawkeeper_core.judge import Judge
 
     terminal, computer, manager = fake_hermes_modules(
         lambda k, v: monkeypatch.setitem(sys.modules, k, v)
     )
+    native_computer_approval = Mock(return_value="session")
+    computer.set_approval_callback(native_computer_approval)
     client = Mock()
     snapshot = rules.make_snapshot([rules.validate_rule(r"CK_CANARY_\d+", target)])
     client.sync_rules.return_value = snapshot
@@ -124,13 +127,17 @@ def test_shared_client_for_both_hermes_interceptors(monkeypatch, target, command
         tool_start_callback=None,
         tool_complete_callback=None,
     )
-    install(Mock(), agent, watcher_url="http://watcher")
+    install(Judge(), agent, watcher_url="http://watcher")
     hook = manager._hooks["pre_tool_call"][0]
     assert f"learned:{target}" in hook(tool_name="terminal", args={"command": command})["message"]
     assert terminal.callback(command) == "deny"
-    assert terminal.callback is computer.callback
+    assert computer._approval_callback(command) == "deny"
+    native_computer_approval.assert_not_called()
     factory.assert_called_once()
-    assert client.sync_rules.call_count == 2
+    assert client.sync_rules.call_count == 3
+    assert terminal.callback("ls -la") == "once"
+    assert computer._approval_callback("ls -la") == "session"
+    native_computer_approval.assert_called_once_with("ls -la", "")
     client.sync_rules.side_effect = RuleSyncError("offline")
     assert hook(tool_name="terminal", args={"command": "ls -la"})["action"] == "block"
     assert terminal.callback("ls -la") == "deny"

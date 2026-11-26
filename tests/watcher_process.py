@@ -12,8 +12,11 @@ def fake_hermes_modules(set_module):
     """Provide the public callback/hook surfaces without a Hermes installation."""
     terminal = ModuleType("tools.terminal_tool")
     computer = ModuleType("tools.computer_use.tool")
+    terminal.callback = lambda *_args, **_kwargs: "once"
+    terminal._get_approval_callback = lambda: terminal.callback
+    computer._approval_callback = None
     terminal.set_approval_callback = lambda cb: setattr(terminal, "callback", cb)
-    computer.set_approval_callback = lambda cb: setattr(computer, "callback", cb)
+    computer.set_approval_callback = lambda cb: setattr(computer, "_approval_callback", cb)
     tools = ModuleType("tools")
     tools.__path__ = []
     tools.terminal_tool = terminal

@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict";
+import { clawkeeperShimPlugin } from "../src/index.js";
 import { judge } from "../src/judge.js";
 
 const SERVER_URL = process.env.CLAWKEEPER_TEST_URL || "http://127.0.0.1:7474";
@@ -39,18 +40,25 @@ async function suite() {
     assert.equal(decision.stopReason, "user_requested_stop");
   });
 
-  await it("dangerous bash -> ask_user", async () => {
-    const decision = await judge({
-      mode: "local",
-      forwardedContext: {
-        messages: [
-          { role: "user", content: "deploy" },
-          { role: "tool", toolName: "bash" },
-        ],
+  await it("hook enforces guard results for any tool name", async () => {
+    let beforeToolCall;
+    clawkeeperShimPlugin.register({
+      config: { serverUrl: SERVER_URL },
+      on(name, handler) {
+        assert.equal(name, "before_tool_call");
+        beforeToolCall = handler;
       },
-    }, { serverUrl: SERVER_URL });
-    assert.equal(decision.decision, "ask_user");
-    assert.equal(decision.stopReason, "waiting_user_confirmation");
+    });
+    for (const toolName of ["bash", "terminal", "read_file", "custom_runner"]) {
+      const invoke = (params) => beforeToolCall({ toolName, params });
+      assert.deepEqual(await invoke({ command: "ls -la" }), { block: false });
+      const blocked = await invoke({ request: { command: "whoami" } });
+      assert.equal(blocked.block, true);
+      assert.match(blocked.blockReason, /destructive command pattern/);
+      const review = await invoke({ command: "printf 'unfinished" });
+      assert.equal(review.block, true);
+      assert.match(review.blockReason, /review required/);
+    }
   });
 
   await it("missing forwardedContext", async () => {

@@ -58,6 +58,20 @@ curl http://127.0.0.1:7474/v1/health
 
 Useful endpoints include `/v1/judge`, `/v1/event`, `/v1/audit`, `/v1/scan/logs`, `/v1/scan/skill`, and maintenance harden/rollback routes.
 
+For a proposed tool call, send `toolCall` with `toolName` and the structured
+`params`; provide earlier messages in `forwardedContext.messages` when available.
+The service checks the proposed call before the Judge applies cancellation,
+error, step-limit, and explicitly configured confirmation rules. For example:
+
+```json
+{"toolCall": {"toolName": "my_terminal", "params": {"command": "ls -la"}}}
+```
+
+The command gets the same content checks as `bash`, with no extra confirmation
+by default if those checks pass. OpenClaw and the existing guarded MCP gateway
+use these same pre-execution checks. MCP calls outside a covered host or gateway
+are outside the check path.
+
 ## Run the Watcher
 
 The Watcher is optional. It is useful when single-command rules are not enough and the decision depends on intent, recent tool history, or multi-step drift.
@@ -211,12 +225,12 @@ fully parsed; PowerShell interpreter invocations require review. Simple literal
 `cmd /c` calls are inspected, but this is not a complete Cmd parser.
 
 All 49 built-in patterns use executable scopes. Built-in and learned checks
-share the same extraction and syntax analysis: explicit execution fields
-(`command`, `cmd`, `script`, plus code/input fields on execution tools), including
-nested execution envelopes and generic `payload` fields. Descriptions, headers,
-environment metadata and known file/content tools are excluded from command
-analysis. Custom tools using other fields need a corresponding field mapping.
-Independent path and content guards still apply.
+share the same extraction and syntax analysis. Execution fields such as
+`command`, `cmd`, `script`, `code`, and nested execution envelopes are examined
+regardless of the tool name. Descriptions, headers, environment metadata, and
+file `content` are treated as data for command analysis. The guards inspect
+the call parameters visible to the host, including any inline source; they
+cannot inspect actions taken inside a separate MCP server.
 
 Parsing now produces immutable facts: original source documents, UTF-8 byte
 ranges, argument values/roles, nested code origins, pipeline stages and effective
