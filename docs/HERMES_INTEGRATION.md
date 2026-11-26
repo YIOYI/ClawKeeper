@@ -88,8 +88,20 @@ Three wires get connected on the agent:
   - `agent.tool_start_callback` / `agent.tool_complete_callback` —
     observation hooks. The adapter wraps the existing callbacks
     (chains to them after emitting a `tool_start` / `tool_complete`
-    `AgentEvent`). If `judge.profiler` is set, the events feed the
-    profiler; otherwise they're discarded.
+    `AgentEvent`). Attach `judge.profiler = AgentProfiler()` from
+    `clawkeeper_core.profile` to collect these events. Only starts count as
+    tool calls. The profiler groups sessions by `agent.agent_id` when
+    available and falls back to `agent.session_id`. A profiler error is
+    logged and the host callback still runs. Reinstalling on the same agent
+    replaces its previous ClawKeeper observers and preserves the host callbacks.
+
+`profiler.baseline(agent_id)` returns `None` until the first observation,
+then a snapshot in the same format as `build_agent_profiles`. To check a
+new activity before learning it, pass an event, a window of events, or a behavior summary to
+`profiler.deviation(agent_id, recent)`. With no baseline the result has
+`hasBaseline=False`. Each profiler instance accumulates its own in-memory
+history. Its anomaly reports use `lookbackDays=None` for this observation period.
+After a restart, replay saved events through `update()` to rebuild it.
 
 ## Mapping from JS-style judgement to Hermes return strings
 
@@ -114,7 +126,7 @@ monkey-patching of Hermes internals.
    `clawkeeper_core/adapters/hermes.py`. Hermes refuses to execute.
 4. For *all* tool starts/completes (dangerous or not), Hermes also fires
    `tool_start_callback` / `tool_complete_callback`. Those go through to
-   `AgentProfiler.update(...)` and the decision-memory append-only log.
+   `AgentProfiler.update(...)` when a profiler is attached.
 
 ## Limits to keep in mind
 
