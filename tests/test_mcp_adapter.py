@@ -6,7 +6,7 @@ Skip cleanly when the `mcp` package isn't installed.
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 mcp = pytest.importorskip("mcp", reason="mcp package not installed")
 
@@ -89,6 +89,34 @@ async def test_guard_checks_nested_typed_arguments(server):
         pytest.fail("a blocked handler must not execute")
 
     # MCP 1.x wraps handler errors, while MCP 2.x propagates MCPError.
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
+
+
+class ExcludedCommandRequest(BaseModel):
+    command: str = Field(exclude=True)
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_model_fields_excluded_from_serialization(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(request: ExcludedCommandRequest) -> str:
+        return request.command
+
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
+
+
+class AliasedCommandRequest(BaseModel):
+    text: str = Field(alias="command", exclude=True)
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_commands_under_model_input_aliases(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(request: AliasedCommandRequest) -> str:
+        return request.text
+
     with pytest.raises(Exception, match="Matches a known destructive command pattern"):
         await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
 

@@ -228,7 +228,9 @@ All 49 built-in patterns use executable scopes. Built-in and learned checks
 share the same extraction and syntax analysis. Execution fields such as
 `command`, `cmd`, `script`, `code`, and nested execution envelopes are examined
 regardless of the tool name. Descriptions, headers, environment metadata, and
-file `content` are treated as data for command analysis. The guards inspect
+file `content` are treated as data for command analysis. Generic `input` fields
+are checked for visible operations. A syntax error in that field alone does not
+establish shell execution. The guards inspect
 the call parameters visible to the host, including any inline source; they
 cannot inspect actions taken inside a separate MCP server.
 

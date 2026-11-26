@@ -143,6 +143,14 @@ def test_python_tool_uses_python_language():
     )["block"]
 
 
+def test_extraction_api_reports_the_actual_language():
+    for name in ("bash", "python", "custom_runner"):
+        assert exec_gate.extract_execution_requests(name, {"command": "ls -la"}) == [("shell", "ls -la")]
+        assert exec_gate.extract_execution_requests(name, {"code": "print('hello')"}) == [
+            ("python", "print('hello')"),
+        ]
+
+
 @pytest.mark.parametrize(
     "command", ["rm -fr /", "rm -r -f /", "rm --recursive --force -- /", "rm -Rf *"]
 )

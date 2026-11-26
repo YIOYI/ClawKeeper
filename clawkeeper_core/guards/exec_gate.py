@@ -134,7 +134,10 @@ def extract_execution_requests(
     tool_name: Any, params: Any, bash_like_tools: list[str] | None = None
 ) -> list[tuple[str, str]]:
     """Extract executable fields. The old tool hints are accepted for API compatibility."""
-    return [(language, source) for language, source, _ in _execution_requests(params)]
+    from clawkeeper_core.guards.command_context import request_language  # noqa: PLC0415
+
+    return [(request_language(language, source, path[-1]), source)
+            for language, source, path in _execution_requests(params)]
 
 
 def _execution_requests(params):

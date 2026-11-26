@@ -37,6 +37,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from pydantic import BaseModel, RootModel
 from pydantic_core import to_jsonable_python
 
 try:
@@ -54,10 +55,37 @@ except ImportError:
     _MCP_AVAILABLE = False
 
 from clawkeeper_core.adapters.base import make_event, run_pre_tool_guards
+from clawkeeper_core.guards.exec_gate import _EXECUTION_FIELDS
+from clawkeeper_core.guards.path_guard import _PATH_FIELDS
 from clawkeeper_core.judge import Judge, decision_from_guard
 
 # MCP error codes — JSON-RPC reserved range for invalid params.
 _ERROR_CODE_BLOCKED = -32603  # Internal error, used here for "blocked by safety policy"
+_GUARD_PARAMETER_NAMES = _EXECUTION_FIELDS | _PATH_FIELDS | {"url", "cwd", "workdir", "working_directory"}
+
+
+def _guard_parameters(value: Any) -> Any:
+    """Read bound values before any Pydantic output serializers or exclusions."""
+    if isinstance(value, RootModel):
+        return _guard_parameters(value.root)
+    if isinstance(value, BaseModel):
+        params = _guard_parameters(value.model_extra or {})
+        fields = type(value).model_fields
+        for name, field in fields.items():
+            if name not in vars(value):
+                continue
+            alias = field.validation_alias or field.alias
+            key = name
+            if (name not in _GUARD_PARAMETER_NAMES and isinstance(alias, str)
+                    and alias in _GUARD_PARAMETER_NAMES and alias not in fields):
+                key = alias
+            params[key] = _guard_parameters(vars(value)[name])
+        return params
+    if isinstance(value, dict):
+        return {name: _guard_parameters(argument) for name, argument in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_guard_parameters(argument) for argument in value]
+    return to_jsonable_python(value, fallback=lambda _: None)
 
 
 class GatewayServer:
@@ -136,7 +164,7 @@ class GatewayServer:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             # The SDK may have converted nested JSON objects into typed models.
-            params = to_jsonable_python(bound.arguments, fallback=lambda _: None)
+            params = _guard_parameters(bound.arguments)
             event = make_event(tool_name=tool_name, params=params)
             blocking, _ = run_pre_tool_guards(event)
             if blocking is not None:

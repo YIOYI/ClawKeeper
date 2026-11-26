@@ -120,9 +120,12 @@ def _build_base_decision(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def decision_from_guard(finding: dict[str, Any], mode: str = "local") -> dict[str, Any]:
+def decision_from_guard(
+    finding: dict[str, Any], mode: str = "local", *, can_ask: bool = True,
+) -> dict[str, Any]:
     """Translate a blocking guard finding into the existing adapter decision format."""
     review = finding.get("outcome") == "ask"
+    ask = review and can_ask
     reason = finding.get("reason") or "The tool call was blocked by a pre-execution check."
     severity = str(finding.get("severity") or "high").lower()
     if severity == "hardline":
@@ -132,12 +135,12 @@ def decision_from_guard(finding: dict[str, Any], mode: str = "local") -> dict[st
         evidence.append(f"rule={finding['matched']}")
     return _build_base_decision(
         mode=mode, localEnhanced=mode == "local",
-        decision="ask_user" if review else "stop",
+        decision="ask_user" if ask else "stop",
         stopReason="guard_review" if review else "guard_blocked",
-        shouldContinue=False, needsUserDecision=review,
-        summary=reason, userQuestion=reason if review else None,
+        shouldContinue=False, needsUserDecision=ask,
+        summary=reason, userQuestion=reason if ask else None,
         riskLevel=severity if severity in RISK_ORDER else "high",
-        evidence=evidence, nextAction="ask_user" if review else "stop_run",
+        evidence=evidence, nextAction="ask_user" if ask else "stop_run",
     )
 
 

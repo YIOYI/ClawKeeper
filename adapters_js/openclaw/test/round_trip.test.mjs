@@ -67,6 +67,18 @@ async function suite() {
     assert.equal(decision.stopReason, "missing_input");
   });
 
+  await it("a legacy core cannot allow an unchecked structured call", async () => {
+    const fetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ decision: "continue" }) });
+    try {
+      const decision = await judge({ toolCall: { toolName: "terminal", params: { command: "ls -la" } } });
+      assert.equal(decision.decision, "stop");
+      assert.match(decision.summary, /did not confirm the pre-execution checks/);
+    } finally {
+      globalThis.fetch = fetch;
+    }
+  });
+
   await it("benign read -> continue", async () => {
     const decision = await judge({
       mode: "local",

@@ -32,15 +32,21 @@ export async function judge(payload, options = {}) {
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-    clearTimeout(timer);
-
     if (!res.ok) {
       return _failureDecision(failurePolicy, `server returned ${res.status}`);
     }
-    return await res.json();
+    const decision = await res.json();
+    if (!["continue", "stop", "ask_user"].includes(decision?.decision)) {
+      return _failureDecision(failurePolicy, "server returned an invalid decision");
+    }
+    if (payload.toolCall && decision.decision === "continue" && decision.toolCallChecked !== true) {
+      return _failureDecision(failurePolicy, "server did not confirm the pre-execution checks");
+    }
+    return decision;
   } catch (err) {
-    clearTimeout(timer);
     return _failureDecision(failurePolicy, err?.message || String(err));
+  } finally {
+    clearTimeout(timer);
   }
 }
 

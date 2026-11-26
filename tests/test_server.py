@@ -59,6 +59,7 @@ def test_judge_missing_input(client):
 @pytest.mark.parametrize("name", ["bash", "terminal", "custom_runner", "read_file", "write"])
 @pytest.mark.parametrize(("params", "decision", "guard"), [
     ({"command": "ls -la"}, "continue", None),
+    ({"input": "What's on the agenda?"}, "continue", None),
     ({"request": {"cmd": "whoami"}}, "stop", "exec_gate"),
     ({"input": "whoami"}, "stop", "exec_gate"),
     ({"command": "whoami"}, "stop", "exec_gate"),
@@ -75,6 +76,8 @@ def test_judge_http_checks_content_independent_of_tool_name(client, name, params
     body = response.json()
     assert body["decision"] == decision
     assert body["shouldContinue"] is (decision == "continue")
+    if decision == "continue":
+        assert body["toolCallChecked"] is True
     if guard:
         assert any(item.startswith(f"guard={guard}") for item in body["evidence"])
 
@@ -85,6 +88,22 @@ def test_legacy_proposed_tool_raw_is_checked(client, raw):
         {"role": "tool", "toolName": "custom_runner", "raw": raw},
     ]}})
     assert response.json()["stopReason"] == "guard_blocked"
+
+
+def test_legacy_client_receives_stop_for_incomplete_guard_check(client):
+    response = client.post("/v1/judge", json={"forwardedContext": {"messages": [
+        {"role": "tool", "toolName": "terminal", "raw": "printf 'unfinished"},
+    ]}})
+    assert response.json()["decision"] == "stop"
+    assert response.json()["stopReason"] == "guard_review"
+
+
+@pytest.mark.parametrize(("cwd", "workdir"), [("/tmp", "/etc"), ("/", "etc")])
+def test_guard_resolves_relative_paths_from_the_calls_working_directory(client, cwd, workdir):
+    response = client.post("/v1/judge", json={"toolCall": {
+        "toolName": "read_file", "cwd": cwd, "params": {"workdir": workdir, "path": "shadow"},
+    }})
+    assert response.json()["evidence"][0] == "guard=path_guard"
 
 
 def test_structured_call_does_not_recheck_history(client):

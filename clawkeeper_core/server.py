@@ -104,13 +104,17 @@ async def judge(payload: JudgePayload) -> dict[str, Any]:
             event["cwd"] = call.cwd
         blocking, _ = await run_in_threadpool(run_pre_tool_guards, event)
         if blocking is not None:
-            return decision_from_guard(blocking, payload.mode or "local")
+            # The legacy OpenClaw hook did not enforce ask_user responses.
+            return decision_from_guard(blocking, payload.mode or "local", can_ask=payload.toolCall is not None)
     if payload.toolCall is not None:
         history = messages if isinstance(messages, list) else []
         request["forwardedContext"] = {
             **context, "messages": [*history, {"role": "tool", "toolName": payload.toolCall.toolName}],
         }
-    return await _judge.evaluate_async(request)
+    decision = await _judge.evaluate_async(request)
+    if payload.toolCall is not None:
+        decision["toolCallChecked"] = True
+    return decision
 
 
 # ── Event (fire-and-forget telemetry) ──────────────────────────────────────
