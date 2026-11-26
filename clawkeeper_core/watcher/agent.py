@@ -42,13 +42,13 @@ if not getattr(_openai_pkg.OpenAI, "_ck_ua_patched", False):
     _openai_pkg.OpenAI._ck_ua_patched = True
 
 
-from clawkeeper_core.watcher.learner import STORE, maybe_push_upstream, synthesize_pattern
+from clawkeeper_core.watcher.learner import maybe_push_upstream, synthesize_pattern
 from clawkeeper_core.watcher.policy import apply_post_filter
 from clawkeeper_core.watcher.prompts import (
     SYSTEM_PROMPT,
     render_evaluation_prompt,
 )
-from clawkeeper_core.watcher.reload import apply_learned_patterns
+from clawkeeper_core.watcher.reload import store_learned_pattern
 from clawkeeper_core.watcher.tools import (
     HISTORY,
     classify_finding,
@@ -133,8 +133,7 @@ def _maybe_learn(tool_name: str, args: dict | None, final: dict, model) -> None:
                                    tool_name=tool_name, args=args)
     if candidate is None:
         audit("rejected", skip_reason="no_valid_candidate", tool_name=tool_name)
-    if candidate and STORE.add(candidate):
-        apply_learned_patterns()
+    if candidate and store_learned_pattern(candidate):
         maybe_push_upstream(candidate)
         # broadcast to dashboard
         try:

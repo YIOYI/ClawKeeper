@@ -116,10 +116,14 @@ def default_subject(target: str) -> str:
     return "path" if target == "path_guard" else "invocation"
 
 
-def rule_id(target: str, pattern: str, subject: str | None = None) -> str:
+def rule_id(target: str, pattern: str, subject: str | None = None, *, legacy: bool = False) -> str:
     # Preserve historical identities for the compatibility projection. New
     # subjects are distinct rules even when their regex and guard are equal.
-    key = f"{target}\0{pattern}" if subject in (None, default_subject(target)) else f"{target}\0{subject}\0{pattern}"
+    fields = (target, pattern) if subject in (None, default_subject(target)) else (target, subject, pattern)
+    key = "\0".join(fields)
+    if not legacy and any("\0" in field for field in fields):
+        # JSON escapes embedded separators; the encoded key has no literal NUL.
+        key = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(key.encode()).hexdigest()
 
 

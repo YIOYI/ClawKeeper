@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import tempfile
@@ -153,7 +152,10 @@ def minimize_candidate(candidate: PatternCandidate) -> PatternCandidate:  # noqa
         raise ValueError(candidate.inactive_reason)
     subject = checked_subject(candidate.guard_target, candidate.subject)
     legacy_ids = candidate.legacy_ids or []
-    if not isinstance(legacy_ids, list) or any(i != rule_id(candidate.guard_target, candidate.pattern) for i in legacy_ids):
+    if not isinstance(legacy_ids, list) or any(i not in (
+        rule_id(candidate.guard_target, candidate.pattern),
+        rule_id(candidate.guard_target, candidate.pattern, legacy=True),
+    ) for i in legacy_ids):
         raise ValueError("invalid legacy rule identities")
     if (candidate.guard_target == "path_guard" and candidate.source_view_version < VALIDATION_VERSION
             and (candidate.source_facts is not None or candidate.source_texts is not None)):
@@ -207,9 +209,35 @@ class StoreCapacityError(ValueError):
     """A new record must not make the existing store unreadable."""
 
 
+class AmbiguousPatternError(ValueError):
+    """A legacy identifier matches more than one learned rule."""
+
+
+def stored_rule_id(target: str, pattern: str, subject: str | None, *, legacy: bool = False) -> str:
+    """Keep malformed historical rows addressable without aliasing a valid rule."""
+    if isinstance(target, str) and isinstance(pattern, str) and (subject is None or isinstance(subject, str)):
+        try:
+            return rule_id(target, pattern, subject, legacy=legacy)
+        except UnicodeEncodeError:
+            pass
+    fields = json.dumps([target, pattern, subject], sort_keys=True, ensure_ascii=True)
+    return "invalid-" + hashlib.sha256(fields.encode("ascii")).hexdigest()
+
+
+def _read_candidate(record: dict) -> PatternCandidate | None:
+    try:
+        candidate = PatternCandidate(**record)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return minimize_candidate(candidate)
+    except (TypeError, ValueError, AttributeError, RecursionError) as exc:
+        return replace(candidate, source_command="", source_args=None, source_texts=[], source_facts=[],
+                       inactive_reason=str(exc) if isinstance(exc, ValueError) else "invalid source sample")
+
+
 def validate_candidate(candidate: PatternCandidate) -> LearnedRule:
-    if (isinstance(candidate.confidence, bool) or not isinstance(candidate.confidence, (float, int))
-            or not math.isfinite(candidate.confidence)):
+    if type(candidate.confidence) not in (float, int):
         raise ValueError("invalid candidate confidence")
     if not _CANDIDATE_CONFIDENCE <= candidate.confidence <= 1.0:
         raise ValueError("candidate confidence below threshold or outside range")
@@ -264,9 +292,8 @@ class LearnedPatternStore:
             records = self._load()
             migrated = []
             for record in records:
-                try:
-                    candidate = PatternCandidate(**record)
-                except (TypeError, ValueError):
+                safe = _read_candidate(record)
+                if safe is None:
                     audit("rejected", level=logging.WARNING, skip_reason="invalid stored record")
                     if isinstance(record, dict):
                         sanitized_record = dict(record)
@@ -277,11 +304,6 @@ class LearnedPatternStore:
                     else:
                         migrated.append(record)
                     continue
-                try:
-                    safe = minimize_candidate(candidate)
-                except (TypeError, ValueError, AttributeError, RecursionError) as exc:
-                    safe = replace(candidate, source_command="", source_args=None, source_texts=[], source_facts=[],
-                                   inactive_reason=str(exc) if isinstance(exc, ValueError) else "invalid source sample")
                 candidates.append(safe)
                 migrated.append(asdict(safe))
             if migrated != records:
@@ -303,12 +325,16 @@ class LearnedPatternStore:
                        for r in self._load() if isinstance(r, dict))
 
     def add(self, candidate: PatternCandidate) -> bool:
+        return self.add_with_id(candidate) is not None
+
+    def add_with_id(self, candidate: PatternCandidate) -> str | None:
+        """Persist the validated candidate and return its post-migration identity."""
         try:
             candidate = minimize_candidate(candidate)
             rule = validate_candidate(candidate)
         except (TypeError, ValueError) as exc:
             audit("rejected", level=logging.WARNING, skip_reason=str(exc))
-            return False
+            return None
         audit("validated", rule_id=rule.id, guard_target=rule.guard_target)
         with self._lock:
             records = self._load()
@@ -331,38 +357,61 @@ class LearnedPatternStore:
                     # A transient worker failure cannot establish that an
                     # existing rule is invalid or authorize replacing it.
                     audit("rejected", rule_id=rule.id, skip_reason="existing_validation_unavailable")
-                    return False
+                    return None
                 except (TypeError, ValueError):
                     continue  # replace inactive same-identity records atomically
                 audit("rejected", rule_id=rule.id, skip_reason="duplicate")
-                return False
+                return None
             records = retained
             pattern_chars = sum(len(r["pattern"]) for r in records
                                 if isinstance(r, dict) and isinstance(r.get("pattern"), str))
             if len(records) >= MAX_PATTERNS or pattern_chars + len(candidate.pattern) > MAX_PATTERN_SET_CHARS:
                 audit("rejected", rule_id=rule.id, skip_reason="store_capacity")
-                return False
+                return None
             records.append(asdict(candidate))
             try:
                 self._save(records)
             except StoreCapacityError:
                 audit("rejected", rule_id=rule.id, skip_reason="store_byte_capacity")
-                return False
+                return None
         audit("stored", rule_id=rule.id, guard_target=rule.guard_target)
-        return True
+        return rule.id
 
-    def remove(self, pattern_hash: str) -> bool:
+    def remove(self, pattern_hash: str, *, exact: bool = False) -> bool:
         with self._lock:
             records = self._load()
-            before = len(records)
-            records = [r for r in records
-                       if not (isinstance(r, dict) and isinstance(r.get("pattern"), str) and
-                               (hashlib.sha256(r["pattern"].encode()).hexdigest() == pattern_hash or
-                                pattern_hash in (r.get("legacy_ids") or []) or
-                                rule_id(r.get("guard_target", ""), r["pattern"], r.get("subject")) == pattern_hash))]
-            if len(records) == before:
+            matches = set()
+            retained = []
+            for record in records:
+                if not isinstance(record, dict) or "pattern" not in record:
+                    retained.append(record)
+                    continue
+                pattern = record["pattern"]
+                target = record.get("guard_target", "")
+                subject = record.get("subject")
+                aliases = record.get("legacy_ids")
+                if subject is None and record.get("source_view_version") == _NAME_ONLY_VIEW_VERSION:
+                    # A restored v3 file may not have gone through startup/list migration yet.
+                    candidate = _read_candidate(record)
+                    if candidate is not None:
+                        subject, aliases = candidate.subject, candidate.legacy_ids
+                identity = stored_rule_id(target, pattern, subject)
+                legacy_match = not exact and isinstance(pattern, str) and (
+                    hashlib.sha256(pattern.encode(errors="surrogatepass")).hexdigest() == pattern_hash
+                    or stored_rule_id(target, pattern, subject, legacy=True) == pattern_hash
+                    or (isinstance(aliases, list) and pattern_hash in aliases
+                        and pattern_hash in (stored_rule_id(target, pattern, None),
+                                             stored_rule_id(target, pattern, None, legacy=True)))
+                )
+                if pattern_hash == identity or legacy_match:
+                    matches.add(identity)
+                else:
+                    retained.append(record)
+            if len(matches) > 1:
+                raise AmbiguousPatternError("use the listed rule ID with exact=true")
+            if not matches:
                 return False
-            self._save(records)
+            self._save(retained)
         return True
 
 

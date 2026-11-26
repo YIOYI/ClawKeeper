@@ -130,11 +130,32 @@ Legacy records are migrated atomically when read, clearing raw `source_command`
 and `source_args`. Invalid records remain inspectable with their source fields
 cleared. `/watcher/learned` preserves the list response and policy metadata but
 returns empty/null source fields and never returns `source_texts` or `source_facts`.
-Deletion accepts legacy pattern hashes (all matching targets), legacy rule IDs
-retained by migration, and new target/subject/pattern rule IDs. The compatibility
-subject retains its historical target-plus-pattern ID. Rules with the same regex
-in different subjects have separate identities. Dashboard text is escaped before
-insertion into HTML.
+Dashboard text is escaped before insertion into HTML.
+
+To delete one rule, take its `id` from `GET /watcher/learned` and call
+`DELETE /watcher/learned/{id}?exact=true`. This selects the target, subject
+and pattern together. Existing clients can still send a unique legacy pattern
+hash or migrated rule ID. An ambiguous identifier returns HTTP 409 and leaves
+all matching rules in place. Restoring a version-3 store preserves both its
+migrated identity and its legacy alias, including deletions before the first
+list or reload.
+
+IDs for patterns containing a literal NUL use escaped fields so the separator
+cannot merge two rules into one identity. Upgrade the Watcher and adapter
+together when using these patterns. The delete endpoint still recognizes their
+old IDs when unambiguous.
+
+The response reports whether this request removed a stored record (`removed`),
+the Watcher's local snapshot state (`watcher_runtime`) and its content `version`.
+A successful delete reports `synchronized` for the requested rule. A repeat
+delete of an absent rule can return the current healthy version without
+revalidating unrelated rules. Hermes picks up that version on
+its next blocking check. A store or reload failure returns HTTP 503 with an
+`error` and the `retained` snapshot version. If the store write succeeded before
+the reload failed, `removed` is true. Use `POST /watcher/rules/reload` to
+retry synchronization against the current store, including any rules learned
+since the deletion. Repeating DELETE also reconciles a stale snapshot when
+the record is still absent.
 
 ### Resource limits and failures
 
