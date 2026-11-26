@@ -7,12 +7,14 @@ from __future__ import annotations
 import time
 
 from clawkeeper_core.profile import (
+    AgentProfiler,
     _cache,
     build_agent_profiles,
     compute_deviation,
     detect_anomalies,
     invalidate_profile_cache,
 )
+from clawkeeper_core.schemas import AgentEvent, Decision, Outcome, Risk
 
 
 def make_event(**overrides):
@@ -72,6 +74,114 @@ class TestBuildAgentProfiles:
         assert sorted(p["knownTools"]) == ["read", "write"]
         assert p["toolDistribution"]["read"] == 0.5
         assert p["toolDistribution"]["write"] == 0.5
+
+
+def test_streaming_baseline_matches_batch_and_can_be_replayed_after_restart():
+    records = [
+        make_event(toolName="Read"),
+        make_event(type="after_tool_call"),
+        make_event(type="llm_output", inputTokens=12, outputTokens=4, cacheReadTokens=2),
+        make_event(sessionKey="agent:agent-abc123:second", toolName="write"),
+    ]
+    decisions = [make_decision(), make_decision(decision="continue")]
+    expected = build_agent_profiles(records, decision_records=decisions)["agent-abc123"]
+    profiler = AgentProfiler()
+    for record in [*records, *decisions]:
+        profiler.update(record)
+    snapshot = profiler.baseline(" AGENT-ABC123 ")
+    assert snapshot == expected
+    snapshot["knownTools"].clear()
+    snapshot["toolDistribution"].clear()
+    assert profiler.baseline("agent-abc123") == expected
+
+    restarted = AgentProfiler()
+    restarted.update({})
+    assert restarted.baseline("agent-abc123") is None
+    assert not restarted.deviation("agent-abc123", records)["hasBaseline"]
+    for record in [*records, *decisions]:
+        restarted.update(record)
+    assert restarted.baseline("agent-abc123") == expected
+
+
+def test_streaming_event_window_deviation_leaves_baseline_intact():
+    def event(kind, payload, agent="worker"):
+        return AgentEvent(ts="2026-03-24T10:00:00Z", agent_id=agent, session_id="one",
+                          kind=kind, payload=payload)
+
+    profiler = AgentProfiler()
+    profiler.update(event("tool_start", {"name": "read"}))
+    profiler.update(event("llm_output", {"inputTokens": 10}).model_dump(mode="json"))
+    profiler.update(event("decision", {"decision": "ask_user"}))
+    baseline = profiler.baseline("worker")
+    assert baseline["dataPointCount"] == 2
+    assert baseline["riskRatio"] == 1
+    assert baseline["judgeDecisionCount"] == 1
+    recent = [
+        event("tool_start", {"name": "write"}),
+        event("tool_start", {"name": "list"}, agent="other"),
+        event("llm_output", {"inputTokens": 50}),
+    ]
+    diff = profiler.deviation("worker", iter(recent))
+    assert diff["novelTools"] == ["write"]
+    assert diff["tokenDeviation"]["input"]["multiplier"] == 5
+    assert detect_anomalies(diff)["detected"]
+    assert profiler.deviation("worker", baseline)["novelTools"] == []
+    assert profiler.baseline("worker") == baseline
+
+
+def test_replay_orders_mixed_timestamp_formats_by_instant():
+    profiler = AgentProfiler()
+    profiler.update(AgentEvent(ts="2026-03-24T09:00:00+08:00", agent_id="worker", kind="message"))
+    later = "2026-03-24T02:00:00Z"
+    profiler.update(make_event(timestamp=later, agentId="worker"))
+    profile = profiler.baseline("worker")
+    assert profile["firstSeen"] == "2026-03-24T09:00:00+08:00"
+    assert profile["lastSeen"] == later
+
+
+def test_foreign_summary_cannot_be_attributed_to_requested_agent():
+    profiler = AgentProfiler()
+    profiler.update(make_event(agentId="worker"))
+    profiler.update(make_event(agentId="other", toolName="list"))
+    foreign = profiler.baseline("other")
+    result = profiler.deviation("worker", foreign)
+    assert result["current"]["toolCallCount"] == 0
+    assert result["toolDistributionDivergence"] == 0
+    assert not detect_anomalies(result)["detected"]
+
+
+def test_native_decision_payload_updates_risk_counts():
+    profiler = AgentProfiler()
+    for outcome in (Outcome.ALLOW, Outcome.ASK, Outcome.DENY):
+        decision = Decision(outcome=outcome, risk=Risk.LOW, reason="test")
+        profiler.update(AgentEvent(ts="2026-03-24T00:00:00Z", agent_id="worker",
+                                   kind="decision", payload=decision.model_dump(mode="json")))
+    baseline = profiler.baseline("worker")
+    assert (baseline["riskDecisionCount"], baseline["judgeDecisionCount"]) == (2, 3)
+
+
+def test_single_recent_event_matches_window_and_reports_observed_baseline():
+    profiler = AgentProfiler()
+    profiler.update(make_event(agentId="worker"))
+    event = AgentEvent(ts="2026-04-24T00:00:00Z", agent_id="worker", kind="tool_start",
+                       payload={"name": "list"})
+    expected = profiler.deviation("worker", [event])
+    assert profiler.deviation("worker", event.model_dump(mode="json")) == expected
+    assert profiler.deviation("worker", event) == expected
+    assert profiler.deviation("worker", make_event(agentId="worker", toolName="list"))["novelTools"] == ["list"]
+    report = detect_anomalies(expected)
+    assert report["detected"]
+    assert report["baselineSummary"]["lookbackDays"] is None
+    assert "7-day" not in report["warning"]
+    assert "7-day" not in report["deviations"][0]["message"]
+
+
+def test_unrepresentable_token_sample_keeps_valid_metrics_and_completes_update():
+    profiler = AgentProfiler()
+    profiler.update(make_event(type="llm_output", inputTokens=2, outputTokens=10**400))
+    profile = profiler.baseline("agent-abc123")
+    assert (profile["dataPointCount"], profile["avgInputTokensPerCall"], profile["totalTokens"]) == (1, 2, 2)
+    assert profile["avgOutputTokensPerCall"] == 0
 
 
 class TestComputeDeviation:

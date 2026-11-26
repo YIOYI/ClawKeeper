@@ -16,11 +16,13 @@ import json
 import math
 import re
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
+from threading import Lock
+from typing import Any
 
 from clawkeeper_core.memory import get_beijing_date_stamp, resolve_decision_memory_dir
+from clawkeeper_core.schemas import AgentEvent
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -41,11 +43,13 @@ def _is_record(value: Any) -> bool:
 
 
 def _positive_number(value: Any) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
-        return float(value)
-    return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def _threshold_number(value: Any, fallback: float) -> float:
@@ -99,7 +103,7 @@ def _get_lookback_date_stamps(lookback_days: Any, reference_date: datetime | Non
     except (TypeError, ValueError):
         safe_days = 7
     if reference_date is None:
-        reference_date = datetime.now(timezone.utc)
+        reference_date = datetime.now(UTC)
     return [
         get_beijing_date_stamp(reference_date - timedelta(days=i))
         for i in range(safe_days)
@@ -118,22 +122,13 @@ def _build_distribution(counts: dict[str, int], total: int) -> dict[str, float]:
 def _create_empty_profile(agent_id: str) -> dict[str, Any]:
     return {
         "agentId": agent_id,
-        "toolDistribution": {},
         "toolCallCount": 0,
-        "avgInputTokensPerCall": 0,
-        "avgOutputTokensPerCall": 0,
-        "avgTotalTokensPerCall": 0,
         "totalTokens": 0,
-        "sessionCount": 0,
-        "avgToolCallsPerSession": 0,
         "riskDecisionCount": 0,
-        "riskRatio": 0,
         "judgeDecisionCount": 0,
-        "knownTools": set(),
         "firstSeen": "",
         "lastSeen": "",
         "dataPointCount": 0,
-        # Accumulators (popped at end of buildAgentProfiles)
         "_toolCounts": {},
         "_sessionKeys": set(),
         "_inputTokenSum": 0,
@@ -145,19 +140,21 @@ def _create_empty_profile(agent_id: str) -> dict[str, Any]:
     }
 
 
-def _ensure_profile(profile_map: dict[str, dict[str, Any]], agent_id: str) -> dict[str, Any]:
-    if agent_id not in profile_map:
-        profile_map[agent_id] = _create_empty_profile(agent_id)
-    return profile_map[agent_id]
-
-
 def _update_timestamp_range(profile: dict[str, Any], timestamp: Any) -> None:
     if not isinstance(timestamp, str) or not timestamp:
         return
-    if not profile["firstSeen"] or timestamp < profile["firstSeen"]:
+    try:
+        instant = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    if not profile["firstSeen"] or instant < profile["_firstInstant"]:
         profile["firstSeen"] = timestamp
-    if not profile["lastSeen"] or timestamp > profile["lastSeen"]:
+        profile["_firstInstant"] = instant
+    if not profile["lastSeen"] or instant > profile["_lastInstant"]:
         profile["lastSeen"] = timestamp
+        profile["_lastInstant"] = instant
 
 
 def _record_token_sample(profile: dict[str, Any], record: dict[str, Any]) -> None:
@@ -234,9 +231,9 @@ def _safe_log2(value: float) -> float:
 
 
 def _jensen_shannon_divergence(left: dict[str, float], right: dict[str, float]) -> float:
-    tools = set((left or {}).keys()) | set((right or {}).keys())
-    if not tools:
+    if not left or not right:
         return 0
+    tools = left.keys() | right.keys()
     divergence = 0.0
     for tool in tools:
         lv = _positive_number((left or {}).get(tool)) or 0
@@ -391,6 +388,64 @@ async def load_event_logs(lookback_days: int = 7) -> list[dict[str, Any]]:
 # ── Core API ───────────────────────────────────────────────────────────────
 
 
+def _accumulate_record(
+    profiles: dict[str, dict[str, Any]], record: dict[str, Any], *, is_decision: bool
+) -> None:
+    agent_id = _resolve_agent_id_from_record(record)
+    if not agent_id:
+        return
+    if agent_id not in profiles:
+        profiles[agent_id] = _create_empty_profile(agent_id)
+    profile = profiles[agent_id]
+    _update_timestamp_range(profile, record.get("timestamp"))
+    session = _resolve_session_identifier(record)
+    if session:
+        profile["_sessionKeys"].add(session)
+
+    if is_decision:
+        profile["judgeDecisionCount"] += 1
+        if record.get("decision") and record["decision"] != "continue":
+            profile["riskDecisionCount"] += 1
+        return
+
+    profile["dataPointCount"] += 1
+    if record.get("type") == "before_tool_call":
+        tool = _normalize_tool_name(record.get("toolName"))
+        if tool:
+            profile["toolCallCount"] += 1
+            counts = profile["_toolCounts"]
+            counts[tool] = counts.get(tool, 0) + 1
+    _record_token_sample(profile, record)
+
+
+def _profile_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {key: value for key, value in profile.items() if not key.startswith("_")}
+    snapshot["knownTools"] = set(profile["_toolCounts"])
+    snapshot["sessionCount"] = len(profile["_sessionKeys"])
+    snapshot["avgToolCallsPerSession"] = (
+        profile["toolCallCount"] / snapshot["sessionCount"]
+        if snapshot["sessionCount"] > 0 else 0
+    )
+    snapshot["toolDistribution"] = _build_distribution(profile["_toolCounts"], profile["toolCallCount"])
+    snapshot["avgInputTokensPerCall"] = (
+        profile["_inputTokenSum"] / profile["_inputTokenSamples"]
+        if profile["_inputTokenSamples"] > 0 else 0
+    )
+    snapshot["avgOutputTokensPerCall"] = (
+        profile["_outputTokenSum"] / profile["_outputTokenSamples"]
+        if profile["_outputTokenSamples"] > 0 else 0
+    )
+    snapshot["avgTotalTokensPerCall"] = (
+        profile["_totalTokenSum"] / profile["_totalTokenSamples"]
+        if profile["_totalTokenSamples"] > 0 else 0
+    )
+    snapshot["riskRatio"] = (
+        profile["riskDecisionCount"] / profile["judgeDecisionCount"]
+        if profile["judgeDecisionCount"] > 0 else 0
+    )
+    return snapshot
+
+
 def build_agent_profiles(
     records: Iterable[dict[str, Any]] | None,
     *,
@@ -398,70 +453,12 @@ def build_agent_profiles(
 ) -> dict[str, dict[str, Any]]:
     profile_map: dict[str, dict[str, Any]] = {}
 
-    for record in records or []:
-        agent_id = _resolve_agent_id_from_record(record)
-        if not agent_id:
-            continue
-        profile = _ensure_profile(profile_map, agent_id)
-        profile["dataPointCount"] += 1
-        _update_timestamp_range(profile, record.get("timestamp"))
+    for record in records or ():
+        _accumulate_record(profile_map, record, is_decision=False)
+    for record in decision_records or ():
+        _accumulate_record(profile_map, record, is_decision=True)
 
-        sess = _resolve_session_identifier(record)
-        if sess:
-            profile["_sessionKeys"].add(sess)
-
-        if record.get("type") == "before_tool_call":
-            tool_name = _normalize_tool_name(record.get("toolName"))
-            if tool_name:
-                profile["toolCallCount"] += 1
-                profile["knownTools"].add(tool_name)
-                profile["_toolCounts"][tool_name] = profile["_toolCounts"].get(tool_name, 0) + 1
-
-        _record_token_sample(profile, record)
-
-    for record in (decision_records or []):
-        agent_id = _resolve_agent_id_from_record(record)
-        if not agent_id:
-            continue
-        profile = _ensure_profile(profile_map, agent_id)
-        _update_timestamp_range(profile, record.get("timestamp"))
-
-        sess = _resolve_session_identifier(record)
-        if sess:
-            profile["_sessionKeys"].add(sess)
-
-        profile["judgeDecisionCount"] += 1
-        if record.get("decision") and record["decision"] != "continue":
-            profile["riskDecisionCount"] += 1
-
-    for profile in profile_map.values():
-        profile["sessionCount"] = len(profile["_sessionKeys"])
-        profile["avgToolCallsPerSession"] = (
-            profile["toolCallCount"] / profile["sessionCount"]
-            if profile["sessionCount"] > 0 else 0
-        )
-        profile["toolDistribution"] = _build_distribution(profile["_toolCounts"], profile["toolCallCount"])
-        profile["avgInputTokensPerCall"] = (
-            profile["_inputTokenSum"] / profile["_inputTokenSamples"]
-            if profile["_inputTokenSamples"] > 0 else 0
-        )
-        profile["avgOutputTokensPerCall"] = (
-            profile["_outputTokenSum"] / profile["_outputTokenSamples"]
-            if profile["_outputTokenSamples"] > 0 else 0
-        )
-        profile["avgTotalTokensPerCall"] = (
-            profile["_totalTokenSum"] / profile["_totalTokenSamples"]
-            if profile["_totalTokenSamples"] > 0 else 0
-        )
-        profile["riskRatio"] = (
-            profile["riskDecisionCount"] / profile["judgeDecisionCount"]
-            if profile["judgeDecisionCount"] > 0 else 0
-        )
-        for k in ("_toolCounts", "_sessionKeys", "_inputTokenSum", "_inputTokenSamples",
-                  "_outputTokenSum", "_outputTokenSamples", "_totalTokenSum", "_totalTokenSamples"):
-            profile.pop(k, None)
-
-    return profile_map
+    return {agent: _profile_snapshot(profile) for agent, profile in profile_map.items()}
 
 
 def compute_deviation(current_behavior: Any = None, baseline: Any = None) -> dict[str, Any]:
@@ -527,7 +524,7 @@ def _pick_higher_severity(left: str, right: str) -> str:
     return right if _SEVERITY_RANK.get(right, 0) > _SEVERITY_RANK.get(left, 0) else left
 
 
-def _build_warning(agent_id: str, findings: list[dict[str, Any]], lookback_days: int) -> str:
+def _build_warning(agent_id: str, findings: list[dict[str, Any]], baseline_label: str) -> str:
     fragments: list[str] = []
     for f in findings[:2]:
         if f["type"] == "novel_tool":
@@ -540,14 +537,16 @@ def _build_warning(agent_id: str, findings: list[dict[str, Any]], lookback_days:
             fragments.append(f.get("message", ""))
     return (
         f"Agent {agent_id} is exhibiting behavior significantly different from its "
-        f"{lookback_days}-day baseline: {' and '.join(fragments)}"
+        f"{baseline_label}: {' and '.join(fragments)}"
     )
 
 
 def detect_anomalies(deviations: Any = None, thresholds: Any = None) -> dict[str, Any]:
     t = thresholds if _is_record(thresholds) else {}
+    d = deviations if _is_record(deviations) else {}
+    period = d.get("lookbackDays", t.get("lookbackDays", 7))
     try:
-        lookback_days = max(1, int(str(t.get("lookbackDays", 7))) or 7)
+        lookback_days = max(1, int(str(period)) or 7) if period is not None else None
     except (TypeError, ValueError):
         lookback_days = 7
     tool_thr = _threshold_number(t.get("toolDeviationThreshold", _DEFAULT_TOOL_DEVIATION_THRESHOLD), _DEFAULT_TOOL_DEVIATION_THRESHOLD)
@@ -555,7 +554,6 @@ def detect_anomalies(deviations: Any = None, thresholds: Any = None) -> dict[str
     novel_sev = str(t.get("novelToolSeverity", _DEFAULT_NOVEL_TOOL_SEVERITY))
     novel_sev = novel_sev if novel_sev in ("low", "medium", "high") else _DEFAULT_NOVEL_TOOL_SEVERITY
 
-    d = deviations if _is_record(deviations) else {}
     if not d.get("hasBaseline") or not d.get("baseline"):
         return {
             "detected": False,
@@ -568,6 +566,7 @@ def detect_anomalies(deviations: Any = None, thresholds: Any = None) -> dict[str
 
     findings: list[dict[str, Any]] = []
     severity = "low"
+    baseline_label = f"{lookback_days}-day baseline" if lookback_days is not None else "observed baseline"
 
     for tool in d.get("novelTools", []):
         severity = _pick_higher_severity(severity, novel_sev)
@@ -576,7 +575,7 @@ def detect_anomalies(deviations: Any = None, thresholds: Any = None) -> dict[str
             "tool": tool,
             "severity": novel_sev,
             "message": (
-                f"Agent has never used '{tool}' in {lookback_days}-day baseline "
+                f"Agent has never used '{tool}' in {baseline_label} "
                 f"({d['baseline']['toolCallCount']} historical calls)"
             ),
         })
@@ -640,7 +639,7 @@ def detect_anomalies(deviations: Any = None, thresholds: Any = None) -> dict[str
         "severity": severity,
         "deviations": findings,
         "baselineSummary": baseline_summary,
-        "warning": _build_warning(d.get("agentId", ""), findings, lookback_days),
+        "warning": _build_warning(d.get("agentId", ""), findings, baseline_label),
     }
 
 
@@ -696,15 +695,70 @@ async def resolve_agent_anomaly(*, body: Any = None, decision: Any = None, confi
 # ── OO façade ──────────────────────────────────────────────────────────────
 
 
+def _accumulate_event(profiles: dict[str, dict[str, Any]], event: AgentEvent | dict[str, Any]) -> None:
+    if isinstance(event, dict) and "kind" in event and "type" not in event:
+        event = AgentEvent.model_validate(event)
+    if isinstance(event, AgentEvent):
+        record = {
+            **event.payload,
+            "agentId": event.agent_id,
+            "sessionId": event.session_id,
+            "sessionKey": None,
+            "timestamp": event.ts.isoformat(),
+            "type": "before_tool_call" if event.kind == "tool_start" else event.kind,
+        }
+        if event.kind == "tool_start":
+            record["toolName"] = event.payload.get("name") or event.payload.get("toolName")
+        is_decision = event.kind == "decision"
+        if is_decision and "decision" not in record and "outcome" in record:
+            record["decision"] = "continue" if record["outcome"] == "allow" else record["outcome"]
+    else:
+        record = event
+        is_decision = record.get("type") == "decision" or ("type" not in record and "decision" in record)
+    _accumulate_record(profiles, record, is_decision=is_decision)
+
+
 class AgentProfiler:
-    def update(self, event: Any) -> None:
-        raise NotImplementedError(
-            "AgentProfiler.update is event-stream API; use build_agent_profiles "
-            "for batch construction from event logs."
-        )
+    """In-memory baseline over events received by this instance.
+
+    A fresh instance starts empty. Replay historical events with update() to
+    restore a baseline after restart. Reads return independent snapshots.
+    """
+
+    def __init__(self) -> None:
+        self._profiles: dict[str, dict[str, Any]] = {}
+        self._lock = Lock()
+
+    def update(self, event: AgentEvent | dict[str, Any]) -> None:
+        """Observe an AgentEvent, its serialized form, or a batch log record."""
+        with self._lock:
+            _accumulate_event(self._profiles, event)
 
     def baseline(self, agent_id: str) -> dict[str, Any] | None:
-        return None
+        """Return this agent's aggregate, or None before its first observation."""
+        with self._lock:
+            profile = self._profiles.get(_normalize_agent_id(agent_id))
+            return _profile_snapshot(profile) if profile is not None else None
 
-    def deviation(self, agent_id: str, recent: Any) -> dict[str, Any]:
-        return compute_deviation(recent, None)
+    def deviation(
+        self, agent_id: str, recent: AgentEvent | dict[str, Any] | Iterable[AgentEvent | dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        """Compare a behavior summary, event or window without learning it."""
+        agent_id = _normalize_agent_id(agent_id)
+        if isinstance(recent, AgentEvent) or (
+            isinstance(recent, dict) and any(key in recent for key in ("type", "kind", "decision"))
+        ):
+            recent = (recent,)
+        if recent is None or isinstance(recent, dict):
+            summary = recent or {}
+            if _normalize_agent_id(summary.get("agentId")) not in ("", agent_id):
+                summary = {}
+            current = {**summary, "agentId": agent_id}
+        else:
+            window: dict[str, dict[str, Any]] = {}
+            for event in recent:
+                _accumulate_event(window, event)
+            current = _profile_snapshot(window[agent_id]) if agent_id in window else {"agentId": agent_id}
+        deviation = compute_deviation(current, self.baseline(agent_id))
+        deviation["lookbackDays"] = None  # This instance learns over its entire observed history.
+        return deviation

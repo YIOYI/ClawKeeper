@@ -19,8 +19,10 @@ If no host approval callback is registered, Hermes handles approval itself.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from clawkeeper_core.adapters.base import (
     DEFAULT_PRE_TOOL_GUARDS,
@@ -388,6 +390,20 @@ def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=Non
     _replace_session_hook(manager, "pre_tool_call", agent, scoped_pre_tool_call)
 
 
+class _ToolObserver:
+    def __init__(self, host: Callable[..., Any] | None, observe: Callable[..., None]) -> None:
+        self.host = host
+        self.observe: Callable[..., None] | None = observe
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        observe = self.observe
+        if observe is not None and not kwargs:
+            observe(*args)
+        if self.host is not None:
+            return self.host(*args, **kwargs)
+        return None
+
+
 def _register_observers(
     judge: Judge,
     agent: Any,
@@ -397,11 +413,8 @@ def _register_observers(
 ) -> None:
     """Wrap `tool_start_callback` / `tool_complete_callback` on the agent.
 
-    Preserves any previously-set callback so multiple wrappers stack.
+    Keep host callbacks when installing or replacing our observers.
     """
-    prev_tool_start = agent.tool_start_callback
-    prev_tool_complete = agent.tool_complete_callback
-
     def on_tool_start(*args: Any) -> None:
         if len(args) == 3:
             tool_call_id, name, tool_args = args
@@ -435,20 +448,12 @@ def _register_observers(
             )
 
         # Existing observer event (for profiler / drift detector).
-        _emit(judge, AgentEvent(
-            ts=_now(),
-            agent_id=getattr(agent, "session_id", "unknown"),
-            session_id=getattr(agent, "session_id", None),
-            kind="tool_start",
-            payload={
-                "tool_call_id": tool_call_id,
-                "name": name,
-                "args_preview": _stringify(tool_args),
-            },
-        ))
+        _emit(judge, agent, "tool_start", {
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "args_preview": _stringify(tool_args),
+        })
 
-        if prev_tool_start:
-            prev_tool_start(*args)
         # NB: we do NOT raise here. Hermes wraps tool_start_callback in a
         # try/except that swallows exceptions; raising is purely advisory.
         # Real blocking happens in `_register_pre_tool_call_hook` below.
@@ -484,29 +489,41 @@ def _register_observers(
             )
 
         # Existing observer
-        _emit(judge, AgentEvent(
-            ts=_now(),
-            agent_id=getattr(agent, "session_id", "unknown"),
-            session_id=getattr(agent, "session_id", None),
-            kind="tool_complete",
-            payload={
-                "tool_call_id": tool_call_id,
-                "name": name,
-                "result_preview": _stringify(result)[:500],
-            },
-        ))
+        _emit(judge, agent, "tool_complete", {
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "result_preview": _stringify(result)[:500],
+        })
 
-        if prev_tool_complete:
-            prev_tool_complete(*args)
+    installed = getattr(agent, "__dict__", {}).setdefault("_clawkeeper_observers", {})
+    for name, observe in (("tool_start_callback", on_tool_start), ("tool_complete_callback", on_tool_complete)):
+        host = getattr(agent, name)
+        previous = installed.get(name)
+        if previous is not None:
+            # A host may still call the previous observer through its own wrapper.
+            previous.observe = None
+        if isinstance(host, _ToolObserver):
+            host = host.host
+        installed[name] = _ToolObserver(host, observe)
+        setattr(agent, name, installed[name])
 
-    agent.tool_start_callback = on_tool_start
-    agent.tool_complete_callback = on_tool_complete
 
-
-def _emit(judge: Judge, event: AgentEvent) -> None:
-    profiler = getattr(judge, "profiler", None)
-    if profiler is not None:
-        profiler.update(event)
+def _emit(
+    judge: Judge, agent: Any, kind: Literal["tool_start", "tool_complete"], payload: dict[str, Any]
+) -> None:
+    try:
+        update = getattr(getattr(judge, "profiler", None), "update", None)
+        if not callable(update):
+            return
+        session_id = getattr(agent, "session_id", None)
+        agent_id = getattr(agent, "agent_id", None) or session_id
+        if agent_id:
+            update(AgentEvent(
+                ts=_now(), agent_id=agent_id, session_id=session_id, kind=kind, payload=payload,
+            ))
+    except Exception:
+        # Profiling is an observer. The host's own callback must still run.
+        logging.getLogger(__name__).exception("Profiler failed to observe Hermes %s", kind)
 
 
 def _now():
