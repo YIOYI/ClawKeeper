@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from clawkeeper_core.judge import (
     DEFAULT_POLICY,
     Judge,
@@ -133,107 +135,42 @@ class TestToolLoopLimit:
         assert d["decision"] != "ask_user" or d["stopReason"] != "tool_loop_limit"
 
 
-# ── High-risk confirmation ────────────────────────────────────────────────
+@pytest.mark.parametrize("name", ["bash", "terminal", "custom_runner", "write", "network"])
+def test_no_default_confirmation_or_risk_by_tool_name(name):
+    decision = Judge().evaluate(make_input([
+        {"role": "user", "content": "list files"},
+        {"role": "tool", "toolName": name, "raw": "ls -la"},
+    ], policy={"maxRiskBeforeStop": "medium", "treatCommandExecutionAsHighRisk": True}))
+    assert decision["decision"] == "continue"
+    assert decision["riskLevel"] == "low"
 
 
-class TestRiskConfirmation:
-    def test_bash_tool_triggers_ask(self):
-        d = judge_forwarded_context(make_input([
-            {"role": "user", "content": "deploy"},
-            {"role": "tool", "toolName": "bash"},
-        ]))
-        assert d["decision"] == "ask_user"
-        assert d["stopReason"] == "waiting_user_confirmation"
-
-    def test_write_tool_triggers_ask(self):
-        d = judge_forwarded_context(make_input([
-            {"role": "user", "content": "save it"},
-            {"role": "tool", "toolName": "write"},
-        ]))
-        assert d["decision"] == "ask_user"
-
-    def test_user_continue_alters_question_wording(self):
-        d = judge_forwarded_context(make_input([
-            {"role": "user", "content": "yes go ahead"},
-            {"role": "tool", "toolName": "bash"},
-        ]))
-        assert d["decision"] == "ask_user"
-        assert "already signaled to continue" in d["userQuestion"]
-
-    def test_auto_continue_allows_bypass(self):
-        d = judge_forwarded_context({
-            "forwardedContext": {"messages": [
-                {"role": "user", "content": "deploy"},
-                {"role": "tool", "toolName": "bash"},
-            ]},
-            "policy": {"autoContinueAllowed": True},
-        })
-        # With autoContinue, bash still escalates risk to medium but doesn't ask;
-        # default maxRiskBeforeStop=critical so this becomes continue.
-        assert d["decision"] == "continue"
+@pytest.mark.parametrize("auto_continue", [False, True])
+def test_explicit_confirmation_policy_still_applies(auto_continue):
+    decision = Judge(policy={
+        "requireUserConfirmationFor": ["Custom Tool"], "autoContinueAllowed": auto_continue,
+    }).evaluate(make_input([{"role": "tool", "toolName": "custom tool"}]))
+    assert decision["decision"] == ("continue" if auto_continue else "ask_user")
 
 
-# ── High-risk policy threshold ────────────────────────────────────────────
+def test_command_text_is_outside_flow_judge():
+    decision = Judge().evaluate(make_input([
+        {"role": "tool", "toolName": "bash", "raw": "unfinished '"},
+    ]))
+    assert decision["decision"] == "continue"
 
 
-class TestRiskThreshold:
-    def test_command_tool_stops_when_threshold_low(self):
-        d = judge_forwarded_context({
-            "forwardedContext": {"messages": [
-                {"role": "user", "content": "ok"},
-                {"role": "tool", "toolName": "bash"},
-            ]},
-            "policy": {"autoContinueAllowed": True, "maxRiskBeforeStop": "medium"},
-        })
-        # bash triggers medium risk; threshold also medium → stop
-        assert d["decision"] == "stop"
-        assert d["stopReason"] == "high_risk_action"
-        assert d["riskLevel"] == "medium"
-
-    def test_no_command_with_low_threshold_continues(self):
-        d = judge_forwarded_context({
-            "forwardedContext": {"messages": [
-                {"role": "user", "content": "ok"},
-                {"role": "tool", "toolName": "read"},
-            ]},
-            "policy": {"maxRiskBeforeStop": "high"},
-        })
-        assert d["decision"] == "continue"
-
-    def test_unknown_threshold_defaults_to_critical(self):
-        d = judge_forwarded_context({
-            "forwardedContext": {"messages": [
-                {"role": "user", "content": "ok"},
-                {"role": "tool", "toolName": "read"},
-            ]},
-            "policy": {"maxRiskBeforeStop": "garbage"},
-        })
-        assert d["decision"] == "continue"
+@pytest.mark.parametrize("text", ["不要停止，继续执行", "Don't stop the build", "stop by the office"])
+def test_stop_words_in_context_are_not_cancellation(text):
+    assert Judge().evaluate(make_input([{"role": "user", "content": text}]))["decision"] == "continue"
 
 
-# ── Happy path ────────────────────────────────────────────────────────────
-
-
-class TestContinue:
-    def test_simple_read_continues(self):
-        d = judge_forwarded_context(make_input([
-            {"role": "user", "content": "read the file"},
-            {"role": "tool", "toolName": "read"},
-        ]))
-        assert d["decision"] == "continue"
-        assert d["riskLevel"] == "low"
-        assert d["continueHint"] is None  # no command tool
-
-    def test_continue_with_command_includes_hint(self):
-        d = judge_forwarded_context({
-            "forwardedContext": {"messages": [
-                {"role": "user", "content": "ok"},
-                {"role": "tool", "toolName": "bash"},
-            ]},
-            "policy": {"autoContinueAllowed": True},
-        })
-        assert d["decision"] == "continue"
-        assert d["continueHint"] and "command execution" in d["continueHint"]
+def test_structured_cancellation_stops():
+    decision = Judge().evaluate({"forwardedContext": {
+        "messages": [{"role": "user", "content": "continue"}],
+        "metadata": {"cancelled": True},
+    }})
+    assert decision["stopReason"] == "user_requested_stop"
 
 
 # ── Mode handling ────────────────────────────────────────────────────────
@@ -295,7 +232,7 @@ class TestJudgeWrapper:
         assert d["stopReason"] == "user_requested_stop"
 
     def test_evaluate_injects_default_policy(self):
-        judge = Judge(policy={"maxRiskBeforeStop": "medium", "autoContinueAllowed": True})
+        judge = Judge(policy={"maxRiskBeforeStop": "low"})
         d = judge.evaluate(make_input([
             {"role": "user", "content": "ok"},
             {"role": "tool", "toolName": "bash"},
@@ -310,11 +247,11 @@ class TestJudgeWrapper:
                 {"role": "user", "content": "ok"},
                 {"role": "tool", "toolName": "bash"},
             ]),
-            "policy": {"autoContinueAllowed": False},  # explicit override
+            "policy": {"requireUserConfirmationFor": ["bash"]},  # explicit override
         })
         assert d["decision"] == "ask_user"
 
     def test_default_policy_constant_matches_module(self):
         # Sanity: the module's DEFAULT_POLICY shape hasn't drifted
         assert DEFAULT_POLICY["maxToolStepsWithoutUserTurn"] == 3
-        assert "bash" in DEFAULT_POLICY["requireUserConfirmationFor"]
+        assert DEFAULT_POLICY["requireUserConfirmationFor"] == []

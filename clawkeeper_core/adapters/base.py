@@ -31,15 +31,23 @@ The decision dict shape (compatible with existing CK code):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from clawkeeper_core.execution import analysis_scope
+from clawkeeper_core.guards.exec_gate import guard_execution
+from clawkeeper_core.guards.path_guard import guard_before_tool_call
+from clawkeeper_core.guards.script_body_scan import script_body_scan_guard
+from clawkeeper_core.guards.url_safety import url_safety_guard
 from clawkeeper_core.learned_rules import pin_snapshot
 
 GuardEvent = dict[str, Any]
 GuardDecision = dict[str, Any]
 GuardCallable = Callable[[GuardEvent], GuardDecision | None]
+
+DEFAULT_PRE_TOOL_GUARDS: tuple[GuardCallable, ...] = (
+    guard_execution, guard_before_tool_call, url_safety_guard, script_body_scan_guard,
+)
 
 
 def make_event(
@@ -111,6 +119,43 @@ def _run_guard_chain(guards, event, *, stop_on_block):
     return blocking, seen
 
 
+def _check_pre_tool_guard(guard: GuardCallable, event: GuardEvent) -> GuardDecision | None:
+    source = getattr(guard, "__name__", "unknown_guard")
+    try:
+        finding = guard(event)
+    except Exception:
+        finding = {"error": True}
+    if finding is None:
+        return None
+    if (not isinstance(finding, dict) or not isinstance(finding.get("block"), bool)
+            or (not finding["block"] and finding.get("error"))):
+        return {"block": True, "outcome": "ask", "source": source, "severity": "high",
+                "reason": "The guard could not complete the check."}
+    if finding["block"] and not finding.get("source"):
+        return {**finding, "source": source}
+    return finding
+
+
+def run_pre_tool_guards(
+    event: GuardEvent, guards: Sequence[GuardCallable] = DEFAULT_PRE_TOOL_GUARDS,
+) -> tuple[GuardDecision | None, list[GuardDecision]]:
+    """Apply the pre-execution checks, preserving a deny over a request for review."""
+    findings = []
+    review = None
+    with pin_snapshot(), analysis_scope():
+        for guard in guards:
+            finding = _check_pre_tool_guard(guard, event)
+            if finding is None:
+                continue
+            findings.append(finding)
+            if finding["block"]:
+                if finding.get("outcome") != "ask":
+                    return finding, findings
+                if review is None:
+                    review = finding
+    return review, findings
+
+
 class BaseAdapter(ABC):
     """Abstract adapter — every per-host integration subclasses this.
 
@@ -142,7 +187,7 @@ class BaseAdapter(ABC):
     # ─── Dispatch entrypoints — host adapters call these from their bound callbacks ───
 
     def _dispatch_pre_tool_call(self, event: GuardEvent) -> GuardDecision | None:
-        blocking, decisions = run_guard_chain(self.pre_guards, event, stop_on_block=True)
+        blocking, decisions = run_pre_tool_guards(event, self.pre_guards)
         self._decision_log.extend(decisions)
         return blocking
 

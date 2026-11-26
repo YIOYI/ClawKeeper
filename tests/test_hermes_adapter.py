@@ -41,7 +41,7 @@ def test_install_does_not_raise():
     install(judge, agent)
 
 
-def test_install_overwrites_approval_callbacks():
+def test_install_preserves_native_approval_when_no_callback_is_configured():
     import tools.terminal_tool as terminal_tool
     from tools.computer_use import tool as cu_tool
 
@@ -58,8 +58,8 @@ def test_install_overwrites_approval_callbacks():
     agent = StubAgent()
     install(judge, agent)
 
-    assert terminal_tool._get_approval_callback() is not None
-    assert cu_tool._approval_callback is not None
+    assert terminal_tool._get_approval_callback() is None
+    assert cu_tool._approval_callback is None
 
 
 def test_install_overwrites_observation_callbacks():
@@ -109,41 +109,35 @@ def test_approval_callback_maps_deny_outcomes():
     assert _HERMES_RETURN_FOR_OUTCOME[Outcome.ASK][Scope.ONCE.value] == "deny"
 
 
-def test_approval_callback_runs_judge_end_to_end():
+def test_approval_callback_runs_guards_before_native_approval():
     """Wire the callback, invoke it as Hermes' terminal_tool would,
     confirm the Judge's Decision flows through to the right return string.
     """
     import tools.terminal_tool as terminal_tool
 
-    judge = Judge()
-    agent = StubAgent()
-    install(judge, agent)
+    def host_approval(*_args):
+        pytest.fail("a blocked call must not reach native approval")
 
-    cb = terminal_tool._get_approval_callback()
-    assert cb is not None
-    # The real Judge runs full context-judge logic. A single dangerous
-    # tool message ("rm -rf /") triggers the high-risk path → ask_user
-    # → maps to "deny" via _HERMES_RETURN_FOR_JS_DECISION.
-    result = cb("rm -rf /tmp/build", "clean build dir")
-    assert result == "deny"
+    terminal_tool.set_approval_callback(host_approval)
+    try:
+        install(Judge(), StubAgent())
+        assert terminal_tool._get_approval_callback()("whoami", "look up current user") == "deny"
+    finally:
+        terminal_tool.set_approval_callback(None)
 
 
-def test_approval_callback_allows_safe_continue_branch():
-    """When the Judge's logic returns "continue" (e.g. an unimportant
-    tool call with no dangerous content), the adapter returns "once".
-    """
+def test_approval_callback_preserves_native_decision():
+    """When guards and Judge pass, return the host's answer."""
     import tools.terminal_tool as terminal_tool
 
     judge = Judge()
-    # autoContinueAllowed bypasses the ask_user branch on high-risk tools
-    judge.policy = {"autoContinueAllowed": True, "maxRiskBeforeStop": "critical"}
     agent = StubAgent()
-    install(judge, agent)
-
-    cb = terminal_tool._get_approval_callback()
-    assert cb is not None
-    result = cb("ls /tmp", "list temp")
-    assert result == "once"
+    terminal_tool.set_approval_callback(lambda *_args: "deny")
+    try:
+        install(judge, agent)
+        assert terminal_tool._get_approval_callback()("ls /tmp", "list temp") == "deny"
+    finally:
+        terminal_tool.set_approval_callback(None)
 
 
 def test_observation_emits_event_to_profiler_when_present():

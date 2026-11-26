@@ -17,7 +17,7 @@ Usage:
 
 What gets routed through Judge:
   - Tool name (used as the JS-style toolName).
-  - Tool arguments (collected as forwardedContext.messages tool-message).
+  - Tool arguments are checked by the pre-execution guards before Judge evaluates context.
   - Optional user-supplied context (e.g. recent messages, session id) via
     `GatewayServer.set_session_context()`.
 
@@ -33,23 +33,59 @@ Decision mapping:
 from __future__ import annotations
 
 import functools
-from typing import Any, Awaitable, Callable
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from pydantic import BaseModel, RootModel
+from pydantic_core import to_jsonable_python
 
 try:
-    from mcp.server.fastmcp import FastMCP
-    from mcp.shared.exceptions import McpError
-    from mcp.types import ErrorData
+    try:
+        from mcp.server.mcpserver import MCPServer
+        from mcp.shared.exceptions import MCPError
+        _MCP_V2 = True
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as MCPServer
+        from mcp.shared.exceptions import McpError as MCPError
+        from mcp.types import ErrorData
+        _MCP_V2 = False
     _MCP_AVAILABLE = True
 except ImportError:
-    FastMCP = None  # type: ignore[assignment]
-    McpError = Exception  # type: ignore[assignment]
-    ErrorData = None  # type: ignore[assignment]
     _MCP_AVAILABLE = False
 
-from clawkeeper_core.judge import Judge
+from clawkeeper_core.adapters.base import make_event, run_pre_tool_guards
+from clawkeeper_core.guards.exec_gate import _EXECUTION_FIELDS
+from clawkeeper_core.guards.path_guard import _PATH_FIELDS
+from clawkeeper_core.judge import Judge, decision_from_guard
 
 # MCP error codes — JSON-RPC reserved range for invalid params.
 _ERROR_CODE_BLOCKED = -32603  # Internal error, used here for "blocked by safety policy"
+_GUARD_PARAMETER_NAMES = _EXECUTION_FIELDS | _PATH_FIELDS | {"url", "cwd", "workdir", "working_directory"}
+
+
+def _guard_parameters(value: Any) -> Any:
+    """Read bound values before any Pydantic output serializers or exclusions."""
+    if isinstance(value, RootModel):
+        return _guard_parameters(value.root)
+    if isinstance(value, BaseModel):
+        params = _guard_parameters(value.model_extra or {})
+        fields = type(value).model_fields
+        for name, field in fields.items():
+            if name not in vars(value):
+                continue
+            alias = field.validation_alias or field.alias
+            key = name
+            if (name not in _GUARD_PARAMETER_NAMES and isinstance(alias, str)
+                    and alias in _GUARD_PARAMETER_NAMES and alias not in fields):
+                key = alias
+            params[key] = _guard_parameters(vars(value)[name])
+        return params
+    if isinstance(value, dict):
+        return {name: _guard_parameters(argument) for name, argument in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_guard_parameters(argument) for argument in value]
+    return to_jsonable_python(value, fallback=lambda _: None)
 
 
 class GatewayServer:
@@ -72,11 +108,11 @@ class GatewayServer:
             )
         self.name = name
         self.judge = judge or Judge()
-        self._fastmcp = FastMCP(name=name, instructions=instructions)
+        self._fastmcp = MCPServer(name=name, instructions=instructions)
         self._session_context: dict[str, Any] = {}
 
     @property
-    def fastmcp(self) -> "FastMCP":
+    def fastmcp(self) -> MCPServer:
         """Escape hatch for tests / advanced users who need direct FastMCP access."""
         return self._fastmcp
 
@@ -121,9 +157,20 @@ class GatewayServer:
     ) -> Callable[..., Awaitable[Any]]:
         """Build the judge-runner that replaces the original tool handler."""
 
+        signature = inspect.signature(fn)
+
         @functools.wraps(fn)
         async def runner(*args: Any, **kwargs: Any) -> Any:
-            payload = self._build_judge_payload(tool_name, kwargs or {"_args": list(args)})
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            # The SDK may have converted nested JSON objects into typed models.
+            params = _guard_parameters(bound.arguments)
+            event = make_event(tool_name=tool_name, params=params)
+            blocking, _ = run_pre_tool_guards(event)
+            if blocking is not None:
+                mode = self._session_context.get("mode", "local")
+                raise _blocked_error(decision_from_guard(blocking, mode), tool_name, reason="guard")
+            payload = self._build_judge_payload(tool_name)
             result = await self.judge.evaluate_async(payload)
             decision = result.get("decision") if isinstance(result, dict) else None
 
@@ -140,14 +187,13 @@ class GatewayServer:
 
         return runner
 
-    def _build_judge_payload(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _build_judge_payload(self, tool_name: str) -> dict[str, Any]:
         session_msgs = self._session_context.get("messages") or []
         if not isinstance(session_msgs, list):
             session_msgs = []
         tool_msg = {
             "role": "tool",
             "toolName": tool_name,
-            "raw": _safe_dumps(args),
         }
         return {
             "mode": self._session_context.get("mode", "local"),
@@ -171,26 +217,13 @@ class GatewayServer:
         self._fastmcp.run(transport=transport)
 
 
-def _safe_dumps(value: Any) -> str:
-    import json
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(value)
-
-
 def _blocked_error(judge_result: dict[str, Any], tool_name: str, *, reason: str) -> Exception:
     summary = judge_result.get("summary") or "Tool call refused by ClawKeeper safety policy."
     stop_reason = judge_result.get("stopReason") or reason
-    if ErrorData is None:
+    if not _MCP_AVAILABLE:
         return RuntimeError(f"{summary} (tool={tool_name}, reason={stop_reason})")
-    return McpError(ErrorData(
-        code=_ERROR_CODE_BLOCKED,
-        message=summary,
-        data={
-            "tool": tool_name,
-            "stopReason": stop_reason,
-            "riskLevel": judge_result.get("riskLevel"),
-            "judge": judge_result,
-        },
-    ))
+    data = {"tool": tool_name, "stopReason": stop_reason,
+            "riskLevel": judge_result.get("riskLevel"), "judge": judge_result}
+    if _MCP_V2:
+        return MCPError(code=_ERROR_CODE_BLOCKED, message=summary, data=data)
+    return MCPError(ErrorData(code=_ERROR_CODE_BLOCKED, message=summary, data=data))

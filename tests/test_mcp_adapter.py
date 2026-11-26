@@ -6,10 +6,11 @@ Skip cleanly when the `mcp` package isn't installed.
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel, Field
 
 mcp = pytest.importorskip("mcp", reason="mcp package not installed")
 
-from clawkeeper_core.adapters.mcp import GatewayServer  # noqa: E402
+from clawkeeper_core.adapters.mcp import GatewayServer, MCPError  # noqa: E402
 from clawkeeper_core.judge import Judge  # noqa: E402
 
 
@@ -23,14 +24,14 @@ def test_construct_server(server):
     assert server.fastmcp is not None
 
 
-def test_register_guarded_tool_appears_in_tool_list(server):
+@pytest.mark.asyncio
+async def test_register_guarded_tool_appears_in_tool_list(server):
     @server.guarded_tool(description="echo input back")
     async def echo(message: str) -> str:
         return message
 
     # The FastMCP instance should now know about the tool.
-    tools = list(server.fastmcp._tool_manager._tools.values())
-    names = [t.name for t in tools]
+    names = [tool.name for tool in await server.fastmcp.list_tools()]
     assert "echo" in names
 
 
@@ -49,14 +50,75 @@ async def test_benign_call_returns_result(server):
 
 
 @pytest.mark.asyncio
-async def test_dangerous_call_raises(server):
-    """A tool named "bash" should hit the high-risk branch and raise."""
-    @server.guarded_tool(name="bash")
-    async def bash(command: str) -> str:
-        return f"ran: {command}"
+@pytest.mark.parametrize("name", ["bash", "terminal", "read_file", "custom_runner"])
+async def test_command_checks_before_handler(server, name):
+    calls = []
 
-    with pytest.raises(Exception):  # McpError when available, RuntimeError otherwise
-        await server.call_tool("bash", {"command": "rm -rf /"})
+    @server.guarded_tool(name=name)
+    async def handler(command: str) -> str:
+        calls.append(command)
+        return "called"
+
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool(name, {"command": "whoami"})
+    assert calls == []
+    await server.call_tool(name, {"command": "ls -la"})
+    assert calls == ["ls -la"]
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_bound_arguments(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(command: str = "whoami") -> str:
+        pytest.fail("a blocked handler must not execute")
+
+    with pytest.raises(MCPError):
+        await handler("whoami")
+    with pytest.raises(MCPError):
+        await handler()
+
+
+class CommandRequest(BaseModel):
+    command: str
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_nested_typed_arguments(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(request: CommandRequest) -> str:
+        pytest.fail("a blocked handler must not execute")
+
+    # MCP 1.x wraps handler errors, while MCP 2.x propagates MCPError.
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
+
+
+class ExcludedCommandRequest(BaseModel):
+    command: str = Field(exclude=True)
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_model_fields_excluded_from_serialization(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(request: ExcludedCommandRequest) -> str:
+        return request.command
+
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
+
+
+class AliasedCommandRequest(BaseModel):
+    text: str = Field(alias="command", exclude=True)
+
+
+@pytest.mark.asyncio
+async def test_guard_checks_commands_under_model_input_aliases(server):
+    @server.guarded_tool(name="custom_runner")
+    async def handler(request: AliasedCommandRequest) -> str:
+        return request.text
+
+    with pytest.raises(Exception, match="Matches a known destructive command pattern"):
+        await server.call_tool("custom_runner", {"request": {"command": "whoami"}})
 
 
 @pytest.mark.asyncio

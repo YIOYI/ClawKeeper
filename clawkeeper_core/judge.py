@@ -20,18 +20,21 @@ from typing import Any
 
 DEFAULT_POLICY: dict[str, Any] = {
     "maxRiskBeforeStop": "critical",
-    "requireUserConfirmationFor": ["exec", "bash", "shell", "network", "write"],
+    "requireUserConfirmationFor": [],
     "autoContinueAllowed": False,
     "maxToolStepsWithoutUserTurn": 3,
-    "treatCommandExecutionAsHighRisk": True,
 }
 
 RISK_ORDER: dict[str, int] = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 # Word boundaries (\b) are intentionally omitted so CJK phrases still match
 # alongside English keywords.
-_USER_STOP_RE = re.compile(r"(停止|取消|不要|算了|终止|stop|cancel|abort|don't|do not)", re.IGNORECASE)
-_USER_CONTINUE_RE = re.compile(r"(继续|是|好的|确认|继续做|ok|okay|yes|continue|go ahead)", re.IGNORECASE)
+_USER_STOP_RE = re.compile(
+    r"^(?:(?:please\s+)?(?:stop|cancel|abort)\b(?!\s+(?:by|at)\b)[^,;.!?\n]*"
+    r"|(?:请\s*)?(?:停止|取消|终止)(?:执行|运行|任务|构建|当前任务)?|不要继续(?:了)?|算了)"
+    r"[。\uFF01\uFF1F.!?\s]*$",
+    re.IGNORECASE,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -53,14 +56,12 @@ def _normalize_message(message: Any) -> dict[str, str] | None:
     tool_name = message.get("toolName") if isinstance(message.get("toolName"), str) else (
         message.get("name") if isinstance(message.get("name"), str) else ""
     )
-    raw = message.get("raw") if isinstance(message.get("raw"), str) else ""
     error = message.get("error") if isinstance(message.get("error"), str) else ""
     result = message.get("result") if isinstance(message.get("result"), str) else ""
     return {
         "role": role,
         "content": content,
         "toolName": tool_name,
-        "raw": raw,
         "error": error,
         "result": result,
     }
@@ -119,6 +120,30 @@ def _build_base_decision(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def decision_from_guard(
+    finding: dict[str, Any], mode: str = "local", *, can_ask: bool = True,
+) -> dict[str, Any]:
+    """Translate a blocking guard finding into the existing adapter decision format."""
+    review = finding.get("outcome") == "ask"
+    ask = review and can_ask
+    reason = finding.get("reason") or "The tool call was blocked by a pre-execution check."
+    severity = str(finding.get("severity") or "high").lower()
+    if severity == "hardline":
+        severity = "critical"
+    evidence = [f"guard={finding.get('source', 'unknown')}"]
+    if finding.get("matched"):
+        evidence.append(f"rule={finding['matched']}")
+    return _build_base_decision(
+        mode=mode, localEnhanced=mode == "local",
+        decision="ask_user" if ask else "stop",
+        stopReason="guard_review" if review else "guard_blocked",
+        shouldContinue=False, needsUserDecision=ask,
+        summary=reason, userQuestion=reason if ask else None,
+        riskLevel=severity if severity in RISK_ORDER else "high",
+        evidence=evidence, nextAction="ask_user" if ask else "stop_run",
+    )
+
+
 # ── Main entry ─────────────────────────────────────────────────────────────
 
 
@@ -164,13 +189,12 @@ def judge_forwarded_context(input: Any = None) -> dict[str, Any]:
 
     tool_messages = [
         m for m in active_messages
-        if m.get("toolName")
+        if (m.get("toolName") or m["role"] == "tool")
         and m["toolName"] != "clawbands_respond"
         and m["toolName"] != "clawkeeper_bands_respond"
     ]
     tool_count = len(tool_messages)
-    tool_names = {m["toolName"].lower() for m in tool_messages if m.get("toolName")}
-    has_command_tool = any(name in tool_names for name in ("exec", "bash", "shell"))
+    tool_names = {m["toolName"].strip().lower() for m in tool_messages if m.get("toolName")}
     has_tool_error = any(m.get("error") for m in active_messages)
     last_user_content = last_user.get("content", "") if last_user else ""
 
@@ -186,12 +210,12 @@ def judge_forwarded_context(input: Any = None) -> dict[str, Any]:
     ])
     evidence.extend(_summarize_evidence(active_messages))
 
-    if _USER_STOP_RE.search(last_user_content):
+    if metadata.get("cancelled") is True or _USER_STOP_RE.fullmatch(last_user_content.strip()):
         return decide(
             decision="stop",
             stopReason="user_requested_stop",
             shouldContinue=False,
-            summary="The latest user message explicitly asks to stop or cancel, so execution should stop.",
+            summary="The run received a cancellation signal or matched a stop instruction.",
             riskLevel="low",
             evidence=evidence,
             nextAction="stop_run",
@@ -230,26 +254,15 @@ def judge_forwarded_context(input: Any = None) -> dict[str, Any]:
                          "of tool calls in the next turn if possible.",
         )
 
-    needs_risk_confirmation = (
-        (has_command_tool and policy["treatCommandExecutionAsHighRisk"])
-        or any(str(k).lower() in tool_names for k in policy["requireUserConfirmationFor"])
-    )
-
-    if needs_risk_confirmation and not policy["autoContinueAllowed"]:
-        question = (
-            "A high-risk action was detected, and the user has already signaled to continue. "
-            "Please confirm one more time before proceeding."
-            if _USER_CONTINUE_RE.search(last_user_content)
-            else "Command execution or another high-risk tool call was detected. "
-                 "Do you want to continue to the next step?"
-        )
+    needs_confirmation = any(str(k).strip().lower() in tool_names for k in policy["requireUserConfirmationFor"])
+    if needs_confirmation and not policy["autoContinueAllowed"]:
         return decide(
             decision="ask_user",
             stopReason="waiting_user_confirmation",
             shouldContinue=False,
             needsUserDecision=True,
-            userQuestion=question,
-            summary="The context contains high-risk actions, and the policy requires explicit user confirmation.",
+            userQuestion="The configured policy requires confirmation. Do you want to continue?",
+            summary="A named tool matched the configured confirmation policy.",
             riskLevel="high",
             evidence=evidence,
             nextAction="ask_user",
@@ -257,7 +270,7 @@ def judge_forwarded_context(input: Any = None) -> dict[str, Any]:
                          "but avoid asking the same confirmation again.",
         )
 
-    highest_risk = "medium" if has_command_tool else "low"
+    highest_risk = "low"
     stop_at = str(policy.get("maxRiskBeforeStop") or "critical").lower()
     if RISK_ORDER[highest_risk] >= (RISK_ORDER.get(stop_at, RISK_ORDER["critical"])):
         return decide(
@@ -280,10 +293,6 @@ def judge_forwarded_context(input: Any = None) -> dict[str, Any]:
         riskLevel=highest_risk,
         evidence=evidence,
         nextAction="continue_run",
-        continueHint=(
-            "If the next turn continues with command execution, run context-judge again."
-            if has_command_tool else None
-        ),
     )
 
 

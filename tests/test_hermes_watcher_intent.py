@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clawkeeper_core.adapters.hermes import install
+from clawkeeper_core.judge import Judge
 from clawkeeper_core.watcher.agent import Watcher
 from clawkeeper_core.watcher.client import WatcherClient
 from clawkeeper_core.watcher.daemon import build_app
@@ -17,6 +18,20 @@ from clawkeeper_core.watcher.tools import SessionHistory
 from tests.watcher_process import fake_hermes_modules
 
 pytestmark = pytest.mark.usefixtures("isolated_learning")
+
+
+@pytest.mark.parametrize("name", ["terminal", "read_file", "custom_runner"])
+def test_hermes_pre_hook_enforces_guards_with_actual_params(monkeypatch, name):
+    _, _, manager = fake_hermes_modules(
+        lambda module_name, module: monkeypatch.setitem(sys.modules, module_name, module)
+    )
+    agent = SimpleNamespace(session_id="test", tool_start_callback=None, tool_complete_callback=None)
+    install(Judge(), agent)
+    hook = manager._hooks["pre_tool_call"][-1]
+    assert hook(tool_name=name, args={"command": "ls -la"}) is None
+    result = hook(tool_name=name, args={"command": "whoami"})
+    assert result["action"] == "block"
+    assert "exec_gate" in result["message"]
 
 
 @pytest.fixture
@@ -39,9 +54,11 @@ def hermes_watcher(monkeypatch):
         def handler(request):
             if request.url.path == "/watcher/evaluate":
                 requests.append(json.loads(request.content))
-            return daemon.request(
-                request.method, str(request.url), content=request.content, headers=request.headers
+            response = daemon.request(
+                request.method, str(request.url), content=request.content, headers=dict(request.headers)
             )
+            # Starlette can use httpx2 while the Watcher client uses httpx.
+            return httpx.Response(response.status_code, headers=dict(response.headers), content=response.content)
 
         client._client.close()
         client._client = httpx.Client(transport=httpx.MockTransport(handler))

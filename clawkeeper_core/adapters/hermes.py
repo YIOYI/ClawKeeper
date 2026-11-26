@@ -5,54 +5,39 @@ no host internals patched for behaviour):
 
 1.  `tools.terminal_tool.set_approval_callback(cb)` and
     `tools.computer_use.tool.set_approval_callback(cb)` — Hermes calls
-    these when its own regex flags a command. ClawKeeper's Judge
-    decides allow/ask/deny here.
+    these when it needs approval. ClawKeeper can refuse the call before
+    delegating to the host's existing approval callback.
 
-2.  `tool_start_callback` / `tool_complete_callback` on `AIAgent` —
-    these fire for EVERY tool call, regardless of whether Hermes
-    flagged it. ClawKeeper runs its proactive guard chain here
-    (exec_gate, path_guard, url_safety) so attacks that bypass
-    Hermes's regex (Python heredocs, multi-turn drift) still get
-    inspected. Closes the structural bypass surfaced by red-team
-    scenario 07.a.
+2.  The `pre_tool_call` hook runs the blocking guard chain for tool calls.
+    The `tool_start_callback` and `tool_complete_callback` observe calls and
+    results for decision logs and profiling.
 
 `install(judge, agent)` registers both. Hermes does not need any patches.
 
-Compatibility: the existing public surface (`install(judge, agent)`,
-behaviour of the approval callback) is preserved. The proactive
-guard chain is additive.
+If no host approval callback is registered, Hermes handles approval itself.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from functools import wraps
+from typing import TYPE_CHECKING, Any
 
 from clawkeeper_core.adapters.base import (
+    DEFAULT_PRE_TOOL_GUARDS,
     GuardCallable,
     make_event,
     run_guard_chain,
+    run_pre_tool_guards,
 )
 from clawkeeper_core.guards.credential_redact import credential_redact_guard
-from clawkeeper_core.guards.exec_gate import guard_execution
-from clawkeeper_core.guards.path_guard import guard_before_tool_call
 from clawkeeper_core.guards.return_content_scan import return_content_scan_guard
-from clawkeeper_core.guards.script_body_scan import script_body_scan_guard
-from clawkeeper_core.guards.url_safety import url_safety_guard
 from clawkeeper_core.judge import Judge
-from clawkeeper_core.learned_rules import match_learned, pin_snapshot
+from clawkeeper_core.learned_rules import pin_snapshot
 from clawkeeper_core.schemas import AgentEvent
 
 if TYPE_CHECKING:
     from run_agent import AIAgent  # noqa: F401
 
-
-# ─── Decision → Hermes-return mapping ──────────────────────────────────────
-
-_HERMES_RETURN_FOR_JS_DECISION: dict[str, str] = {
-    "continue": "once",
-    "stop": "deny",
-    "ask_user": "deny",
-}
 
 # Backwards-compat alias kept so consumers that imported this constant directly
 # don't break.
@@ -89,20 +74,6 @@ class ClawKeeperBlock(Exception):
 
 
 # ─── Default proactive guard chains ────────────────────────────────────────
-
-
-def _default_pre_guards() -> list[GuardCallable]:
-    """Pre-execution guards that inspect upcoming commands.
-
-    Order matters: cheap pattern matches first, then path resolution,
-    then URL parsing.
-    """
-    return [
-        guard_execution,            # dangerous-command regex (CK's broader set than Hermes's)
-        guard_before_tool_call,     # protected file accesses from shared command/path facts
-        url_safety_guard,           # homoglyph + SSRF + blocked-hostname
-        script_body_scan_guard,     # sensitive accesses through bounded path associations
-    ]
 
 
 def _default_post_guards() -> list[GuardCallable]:
@@ -142,7 +113,7 @@ def install(
     Both default chains are conservative: passing your own list lets a
     deployment opt in/out per guard.
     """
-    pre = pre_guards if pre_guards is not None else _default_pre_guards()
+    pre = pre_guards if pre_guards is not None else list(DEFAULT_PRE_TOOL_GUARDS)
     post = post_guards if post_guards is not None else _default_post_guards()
     watcher_client = None
     if watcher_url:
@@ -153,33 +124,19 @@ def install(
     import tools.terminal_tool as terminal_tool
     from tools.computer_use import tool as computer_use_tool
 
-    def approval_cb(command: str, description: str = "") -> str:
-        event = {"toolName": "bash", "params": {"command": command, "description": description}}
-
-        eg = guard_execution(event)
-        if eg.get("block"):
-            _record_decision(agent, "deny", source="exec_gate",
-                             reason=eg.get("reason"), evidence=eg)
-            return "deny"
-
-        pg = guard_before_tool_call(event)
-        if pg.get("block"):
-            _record_decision(agent, "deny", source="path_guard",
-                             reason=pg.get("reason"), evidence=pg)
-            return "deny"
-
-        # Honor synchronized script rules on the approval surface as well.
-        learned_script = match_learned("script_body_scan", event)
-        if learned_script:
-            _record_decision(agent, "deny", source=learned_script["source"],
-                             reason=learned_script["reason"], evidence=learned_script["evidence"])
+    def approval_cb(host_callback, command: str, description: str = "", **kwargs: Any) -> str:
+        event = make_event(tool_name="bash", command=command, description=description)
+        blocking, _ = run_pre_tool_guards(event)
+        if blocking is not None:
+            _record_decision(agent, "deny", source=blocking["source"],
+                             reason=blocking.get("reason"), evidence=blocking)
             return "deny"
 
         # Build the Judge's forwarded-context payload.
         recent = _recent_messages(agent)
         forwarded_messages = [
             *(recent if isinstance(recent, list) else []),
-            {"role": "tool", "toolName": "bash", "raw": command, "content": description},
+            {"role": "tool", "toolName": "bash"},
         ]
         result = judge.evaluate({
             "mode": "local",
@@ -190,15 +147,30 @@ def install(
             "requestId": getattr(agent, "session_id", None),
         })
         js_decision = result.get("decision", "ask_user") if isinstance(result, dict) else "ask_user"
-        hermes_string = _HERMES_RETURN_FOR_JS_DECISION.get(js_decision, "deny")
+        hermes_string = host_callback(command, description, **kwargs) if js_decision == "continue" else "deny"
         _record_decision(agent, hermes_string, source="judge",
                          reason=result.get("stopReason") if isinstance(result, dict) else None,
                          evidence=result if isinstance(result, dict) else {})
         return hermes_string
 
-    guarded_approval = _with_rule_sync(approval_cb, watcher_client, agent, "deny")
-    terminal_tool.set_approval_callback(guarded_approval)
-    computer_use_tool.set_approval_callback(guarded_approval)
+    def wrap_approval(existing):
+        # Reinstallations replace our wrapper while keeping the underlying host callback.
+        host_callback = getattr(existing, "__dict__", {}).get("_clawkeeper_host_approval", existing)
+
+        @wraps(host_callback)
+        def evaluate(command: str, description: str = "", **kwargs: Any) -> str:
+            return approval_cb(host_callback, command, description, **kwargs)
+
+        guarded = _with_rule_sync(evaluate, watcher_client, agent, "deny")
+        guarded._clawkeeper_host_approval = host_callback
+        return guarded
+
+    terminal_approval = terminal_tool._get_approval_callback()
+    if terminal_approval is not None:
+        terminal_tool.set_approval_callback(wrap_approval(terminal_approval))
+    computer_approval = computer_use_tool._approval_callback
+    if computer_approval is not None:
+        computer_use_tool.set_approval_callback(wrap_approval(computer_approval))
 
     # NEW: register a Hermes `pre_tool_call` plugin hook.  This is the
     # documented Hermes API for blocking tool execution from outside the
@@ -352,17 +324,14 @@ def _register_pre_tool_call_hook(judge, agent, *, pre_guards, watcher_client=Non
     )
 
     def ck_pre_tool_call(*, tool_name, args, task_id="", session_id="", tool_call_id="", **_kwargs):
-        command = ""
-        if isinstance(args, dict):
-            command = str(args.get("command") or args.get("url") or "")
         event = make_event(
             tool_name=str(tool_name),
-            command=command,
+            command=args if isinstance(args, str) else "",
             params=args if isinstance(args, dict) else {},
             session_id=getattr(agent, "session_id", None),
             direction="pre_tool_call",
         )
-        blocking, decisions = run_guard_chain(pre_guards, event, stop_on_block=True)
+        blocking, decisions = run_pre_tool_guards(event, pre_guards)
         for d in decisions:
             if d is None:
                 continue
@@ -442,17 +411,10 @@ def _register_observers(
             return
 
         # Build the standard event the guards consume.
-        command = ""
-        params_dict = {}
-        if isinstance(tool_args, dict):
-            params_dict = dict(tool_args)
-            command = str(tool_args.get("command") or tool_args.get("url") or "")
-        else:
-            command = str(tool_args)
         event = make_event(
             tool_name=str(name),
-            command=command,
-            params=params_dict,
+            command=tool_args if isinstance(tool_args, str) else "",
+            params=tool_args if isinstance(tool_args, dict) else {},
             session_id=getattr(agent, "session_id", None),
             direction="pre_tool_call",
         )
@@ -460,7 +422,7 @@ def _register_observers(
         # Proactive guard chain — closes scenario 07.a (Hermes regex missed
         # the heredoc, so approval_cb was never invoked; now we run the same
         # guards on every tool start).
-        blocking, decisions = run_guard_chain(pre_guards, event, stop_on_block=True)
+        _, decisions = run_pre_tool_guards(event, pre_guards)
         for d in decisions:
             if d is None:
                 continue

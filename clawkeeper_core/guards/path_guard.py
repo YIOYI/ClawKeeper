@@ -180,7 +180,12 @@ def path_facts(event: dict, *, bash_like_tools=None):
 
 def event_cwd(event):
     params = event.get("params") or {}
-    return event.get("cwd") or params.get("cwd") or params.get("workdir") or params.get("working_directory")
+    base = event.get("cwd")
+    for key in ("cwd", "workdir", "working_directory"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return normalize_path(value, base)
+    return base
 
 
 @analysis_scope()

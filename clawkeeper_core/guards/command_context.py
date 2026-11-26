@@ -589,12 +589,17 @@ def _effective_stdin(redirects) -> Redirection | None:
     return channels.get(0)
 
 
-def _shell(source: str, result: CommandAnalysis, depth: int, *, kind: str | None = None) -> None:
+def _shell(
+    source: str, result: CommandAnalysis, depth: int, *, kind: str | None = None,
+    require_valid_syntax: bool = True,
+) -> None:
     with result.document(source, "shell", kind or ("tool" if result.origin is None else "inline")):
-        _shell_body(source, result, depth)
+        _shell_body(source, result, depth, require_valid_syntax=require_valid_syntax)
 
 
-def _shell_body(source: str, result: CommandAnalysis, depth: int) -> None:  # noqa: PLR0912, PLR0915 -- bounded syntax node dispatch
+def _shell_body(  # noqa: PLR0912, PLR0915 -- bounded syntax node dispatch
+    source: str, result: CommandAnalysis, depth: int, *, require_valid_syntax: bool,
+) -> None:
     if depth > MAX_DEPTH:
         raise AnalysisIncomplete("nested execution depth exceeded")
     data = source.encode("utf-8")
@@ -602,7 +607,7 @@ def _shell_body(source: str, result: CommandAnalysis, depth: int) -> None:  # no
     if result._bytes < 0:
         raise AnalysisIncomplete("command source budget exhausted")
     root = Parser(_LANGUAGE).parse(data).root_node
-    if root.has_error:
+    if root.has_error and require_valid_syntax:
         result.fail("invalid or unsupported shell syntax")
     stack = [root]
     pipelines = []
@@ -756,10 +761,49 @@ def analyze_python(source: str) -> Analysis:
     return result.freeze()
 
 
+def _looks_like_python_source(source: str, remaining_bytes: int, *, prefer_shell: bool) -> bool:
+    """Recognize Python syntax in generic source fields; bare words stay shell."""
+    data = source.encode()
+    if len(data) > remaining_bytes:
+        return False
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    # A bare expression such as a program name can still be a shell call.
+    if any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Name, ast.BinOp))
+           for stmt in tree.body):
+        return False
+    if any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) for stmt in tree.body):
+        return True
+    python_syntax = any(
+        isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign,
+                          ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.With, ast.For,
+                          ast.While, ast.If, ast.Try, ast.Raise, ast.Assert, ast.AugAssign))
+        for stmt in tree.body
+    )
+    if not python_syntax:
+        return False
+    return not prefer_shell or Parser(_LANGUAGE).parse(data).root_node.has_error
+
+
+def request_language(language: str, source: str, field: str, remaining_bytes: int = MAX_SOURCE_BYTES) -> str:
+    if language == "source":
+        prefer_shell = field in {"command", "cmd"}
+        return "python" if _looks_like_python_source(source, remaining_bytes, prefer_shell=prefer_shell) else "shell"
+    return language
+
+
 def analyze_requests(requests: list[tuple[str, str, tuple[str, ...]]]) -> Analysis:
     """All executable fields in an event share source, node and byte budgets."""
     result = CommandAnalysis()
     for language, source, path in requests:
         result.field = path
-        (_python if language == "python" else _shell)(source, result, 0)
+        field = path[-1] if path else ""
+        if request_language(language, source, field, result._bytes) == "python":
+            _python(source, result, 0)
+        else:
+            # Generic input can be prose. Keep findings from visible calls, but
+            # a syntax error there alone doesn't establish shell execution.
+            _shell(source, result, 0, require_valid_syntax=field != "input")
     return result.freeze()

@@ -103,12 +103,11 @@ class Policy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_risk_before_stop: Risk = Risk.CRITICAL
-    require_user_confirmation_for: list[str] = Field(
-        default_factory=lambda: ["exec", "bash", "shell", "network", "write"]
-    )
+    require_user_confirmation_for: list[str] = Field(default_factory=list)
     auto_continue_allowed: bool = False
     max_tool_steps_without_user_turn: int = 3
-    treat_command_execution_as_high_risk: bool = True
+    # Accepted in existing configuration, but no longer used by the Judge.
+    treat_command_execution_as_high_risk: bool = False
     schema_version: int = 1
 
 
